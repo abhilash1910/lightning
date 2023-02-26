@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,8 +23,8 @@ from typing import Any, Dict, Mapping, Optional, Union
 
 from lightning_utilities.core.imports import module_available
 from torch import Tensor
-from torch.nn import Module
 
+import lightning.pytorch as pl
 from lightning.fabric.utilities.logger import _add_prefix, _convert_params, _flatten_dict
 from lightning.pytorch.loggers.logger import Logger, rank_zero_experiment
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
@@ -160,7 +160,7 @@ class CometLogger(Logger):
         audio = "<path to audio data>"
         logger.experiment.log_audio(audio, file_name="my_audio.wav")
 
-    Log arbitrary data assets:
+    Log arbitary data assets:
 
     You can log any type of data to Comet as an asset. These can be model
     checkpoints, datasets, debug logs, etc.
@@ -423,6 +423,6 @@ class CometLogger(Logger):
         state["_experiment"] = None
         return state
 
-    def log_graph(self, model: Module, input_array: Optional[Tensor] = None) -> None:
+    def log_graph(self, model: "pl.LightningModule", input_array: Optional[Tensor] = None) -> None:
         if self._experiment is not None:
             self._experiment.set_model_graph(model)

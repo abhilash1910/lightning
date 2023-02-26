@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,23 +16,37 @@ Convention:
  - Do not include any `_TYPE` suffix
  - Types used in public hooks (as those in the `LightningModule` and `Callback`) should be public (no leading `_`)
 """
+from argparse import _ArgumentGroup, ArgumentParser
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Protocol, runtime_checkable, Type, Union
+from typing import Any, Dict, Generator, List, Mapping, Optional, Sequence, Type, Union
 
 import torch
 from torch import Tensor
+from torch.utils.data import DataLoader
 from torchmetrics import Metric
+from typing_extensions import Protocol, runtime_checkable
 
 from lightning.fabric.utilities.types import _TORCH_LRSCHEDULER, LRScheduler, ProcessGroup, ReduceLROnPlateau
 
 _NUMBER = Union[int, float]
 _METRIC = Union[Metric, Tensor, _NUMBER]
+_METRIC_COLLECTION = Union[_METRIC, Mapping[str, _METRIC]]
 STEP_OUTPUT = Union[Tensor, Dict[str, Any]]
+EPOCH_OUTPUT = List[STEP_OUTPUT]
 _EVALUATE_OUTPUT = List[Dict[str, float]]  # 1 dict per DataLoader
 _PREDICT_OUTPUT = Union[List[Any], List[List[Any]]]
-TRAIN_DATALOADERS = Any  # any iterable or collection of iterables
-EVAL_DATALOADERS = Any  # any iterable or collection of iterables
+TRAIN_DATALOADERS = Union[
+    DataLoader,
+    Sequence[DataLoader],
+    Sequence[Sequence[DataLoader]],
+    Sequence[Dict[str, DataLoader]],
+    Dict[str, DataLoader],
+    Dict[str, Dict[str, DataLoader]],
+    Dict[str, Sequence[DataLoader]],
+]
+EVAL_DATALOADERS = Union[DataLoader, Sequence[DataLoader]]
+_ADD_ARGPARSE_RETURN = Union[_ArgumentGroup, ArgumentParser]
 
 
 @runtime_checkable
@@ -118,3 +132,5 @@ class LRSchedulerConfig:
     monitor: Optional[str] = None
     # enforce that the monitor exists for ReduceLROnPlateau
     strict: bool = True
+    # opt_idx assigned internally if not assigned by user
+    opt_idx: Optional[int] = None

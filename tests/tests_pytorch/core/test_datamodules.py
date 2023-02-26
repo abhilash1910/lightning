@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pickle
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
 from typing import Any, Dict
 from unittest import mock
@@ -21,13 +21,13 @@ from unittest.mock import call, Mock, PropertyMock
 import pytest
 import torch
 
-from lightning.pytorch import LightningDataModule, seed_everything, Trainer
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.demos.boring_classes import BoringDataModule, BoringModel
-from lightning.pytorch.profilers.simple import SimpleProfiler
-from lightning.pytorch.trainer.states import TrainerFn
-from lightning.pytorch.utilities import _OMEGACONF_AVAILABLE, AttributeDict
-from lightning.pytorch.utilities.exceptions import MisconfigurationException
+from pytorch_lightning import LightningDataModule, seed_everything, Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.demos.boring_classes import BoringDataModule, BoringModel
+from pytorch_lightning.profilers.simple import SimpleProfiler
+from pytorch_lightning.trainer.states import TrainerFn
+from pytorch_lightning.utilities import _OMEGACONF_AVAILABLE, AttributeDict
+from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from tests_pytorch.helpers.datamodules import ClassifDataModule
 from tests_pytorch.helpers.runif import RunIf
 from tests_pytorch.helpers.simple_models import ClassificationModel
@@ -36,8 +36,8 @@ if _OMEGACONF_AVAILABLE:
     from omegaconf import OmegaConf
 
 
-@mock.patch("lightning.pytorch.trainer.trainer.Trainer.node_rank", new_callable=PropertyMock)
-@mock.patch("lightning.pytorch.trainer.trainer.Trainer.local_rank", new_callable=PropertyMock)
+@mock.patch("pytorch_lightning.trainer.trainer.Trainer.node_rank", new_callable=PropertyMock)
+@mock.patch("pytorch_lightning.trainer.trainer.Trainer.local_rank", new_callable=PropertyMock)
 def test_can_prepare_data(local_rank, node_rank):
     dm = Mock(spec=LightningDataModule)
     dm.prepare_data_per_node = True
@@ -132,6 +132,23 @@ class DataDirDataModule(BoringDataModule):
         self.data_dir = data_dir
 
 
+def test_dm_add_argparse_args(tmpdir):
+    parser = ArgumentParser()
+    parser = DataDirDataModule.add_argparse_args(parser)
+    args = parser.parse_args(["--data_dir", str(tmpdir)])
+    assert args.data_dir == str(tmpdir)
+
+
+def test_dm_init_from_argparse_args(tmpdir):
+    parser = ArgumentParser()
+    parser = DataDirDataModule.add_argparse_args(parser)
+    args = parser.parse_args(["--data_dir", str(tmpdir)])
+    dm = DataDirDataModule.from_argparse_args(args)
+    dm.prepare_data()
+    dm.setup("fit")
+    assert dm.data_dir == args.data_dir == str(tmpdir)
+
+
 def test_dm_pickle_after_init():
     dm = BoringDataModule()
     pickle.dumps(dm)
@@ -145,7 +162,11 @@ def test_train_loop_only(tmpdir):
     model = ClassificationModel()
 
     model.validation_step = None
+    model.validation_step_end = None
+    model.validation_epoch_end = None
     model.test_step = None
+    model.test_step_end = None
+    model.test_epoch_end = None
 
     trainer = Trainer(default_root_dir=tmpdir, max_epochs=1, enable_model_summary=False)
 
@@ -163,6 +184,8 @@ def test_train_val_loop_only(tmpdir):
     model = ClassificationModel()
 
     model.validation_step = None
+    model.validation_step_end = None
+    model.validation_epoch_end = None
 
     trainer = Trainer(default_root_dir=tmpdir, max_epochs=1, enable_model_summary=False)
 
@@ -207,7 +230,7 @@ def test_dm_checkpoint_save_and_load(tmpdir):
 
     for trainer_fn in TrainerFn:
         trainer.state.fn = trainer_fn
-        trainer._checkpoint_connector._restore_modules_and_callbacks(checkpoint_path)
+        trainer._restore_modules_and_callbacks(checkpoint_path)
         assert dm.my_state_dict == {"my": "state_dict"}
 
 
@@ -254,7 +277,11 @@ def test_dm_reload_dataloaders_every_n_epochs(tmpdir):
     model = BoringModel()
 
     model.validation_step = None
+    model.validation_step_end = None
+    model.validation_epoch_end = None
     model.test_step = None
+    model.test_step_end = None
+    model.test_epoch_end = None
 
     trainer = Trainer(default_root_dir=tmpdir, max_epochs=3, limit_train_batches=2, reload_dataloaders_every_n_epochs=2)
     trainer.fit(model, dm)
@@ -279,7 +306,7 @@ def test_dm_init_from_datasets_dataloaders(iterable):
 
     train_ds = ds()
     dm = LightningDataModule.from_datasets(train_ds, batch_size=4, num_workers=0)
-    with mock.patch("lightning.pytorch.core.datamodule.DataLoader") as dl_mock:
+    with mock.patch("pytorch_lightning.core.datamodule.DataLoader") as dl_mock:
         dm.train_dataloader()
         dl_mock.assert_called_once_with(train_ds, batch_size=4, shuffle=not iterable, num_workers=0, pin_memory=True)
     with pytest.raises(MisconfigurationException, match="`val_dataloader` must be implemented"):
@@ -289,7 +316,7 @@ def test_dm_init_from_datasets_dataloaders(iterable):
 
     train_ds_sequence = [ds(), ds()]
     dm = LightningDataModule.from_datasets(train_ds_sequence, batch_size=4, num_workers=0)
-    with mock.patch("lightning.pytorch.core.datamodule.DataLoader") as dl_mock:
+    with mock.patch("pytorch_lightning.core.datamodule.DataLoader") as dl_mock:
         dm.train_dataloader()
         dl_mock.assert_has_calls(
             [
@@ -305,7 +332,7 @@ def test_dm_init_from_datasets_dataloaders(iterable):
     valid_ds = ds()
     test_ds = ds()
     dm = LightningDataModule.from_datasets(val_dataset=valid_ds, test_dataset=test_ds, batch_size=2, num_workers=0)
-    with mock.patch("lightning.pytorch.core.datamodule.DataLoader") as dl_mock:
+    with mock.patch("pytorch_lightning.core.datamodule.DataLoader") as dl_mock:
         dm.val_dataloader()
         dl_mock.assert_called_with(valid_ds, batch_size=2, shuffle=False, num_workers=0, pin_memory=True)
         dm.test_dataloader()
@@ -317,7 +344,7 @@ def test_dm_init_from_datasets_dataloaders(iterable):
     test_dss = [ds(), ds()]
     predict_dss = [ds(), ds()]
     dm = LightningDataModule.from_datasets(train_ds, valid_dss, test_dss, predict_dss, batch_size=4, num_workers=0)
-    with mock.patch("lightning.pytorch.core.datamodule.DataLoader") as dl_mock:
+    with mock.patch("pytorch_lightning.core.datamodule.DataLoader") as dl_mock:
         dm.val_dataloader()
         dm.test_dataloader()
         dm.predict_dataloader()

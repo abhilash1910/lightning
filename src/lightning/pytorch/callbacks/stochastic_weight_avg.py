@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@ from torch.optim.swa_utils import SWALR
 import lightning.pytorch as pl
 from lightning.fabric.utilities.types import LRScheduler
 from lightning.pytorch.callbacks.callback import Callback
-from lightning.pytorch.strategies import DeepSpeedStrategy
-from lightning.pytorch.strategies.fsdp import FSDPStrategy
+from lightning.pytorch.strategies import DDPFullyShardedStrategy, DeepSpeedStrategy
+from lightning.pytorch.strategies.fully_sharded_native import DDPFullyShardedNativeStrategy
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_warn
 from lightning.pytorch.utilities.types import LRSchedulerConfig
@@ -146,7 +146,7 @@ class StochasticWeightAveraging(Callback):
         return any(isinstance(module, nn.modules.batchnorm._BatchNorm) for module in pl_module.modules())
 
     def setup(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", stage: str) -> None:
-        if isinstance(trainer.strategy, (FSDPStrategy, DeepSpeedStrategy)):
+        if isinstance(trainer.strategy, (DDPFullyShardedStrategy, DDPFullyShardedNativeStrategy, DeepSpeedStrategy)):
             raise MisconfigurationException("SWA does not currently support sharded models.")
 
         # copy the model before moving it to accelerator device.
@@ -212,8 +212,8 @@ class StochasticWeightAveraging(Callback):
                     "This may be caused by loading a checkpoint from an older version of PyTorch Lightning."
                 )
 
-            # We assert that there is only one optimizer on fit start
-            default_scheduler_cfg = LRSchedulerConfig(self._swa_scheduler)
+            # We assert that there is only one optimizer on fit start, so know opt_idx is always 0
+            default_scheduler_cfg = LRSchedulerConfig(self._swa_scheduler, opt_idx=0)
             assert default_scheduler_cfg.interval == "epoch" and default_scheduler_cfg.frequency == 1
 
             if trainer.lr_scheduler_configs:
@@ -250,12 +250,12 @@ class StochasticWeightAveraging(Callback):
 
             # There is no need to perform either backward or optimizer.step as we are
             # performing only one pass over the train data-loader to compute activation statistics
-            # Therefore, we will virtually increase the number of training batches by 1 and skip backward.
-            trainer.fit_loop.max_batches += 1
+            # Therefore, we will virtually increase `num_training_batches` by 1 and skip backward.
+            trainer.num_training_batches += 1
             trainer.fit_loop._skip_backward = True
             self._accumulate_grad_batches = trainer.accumulate_grad_batches
-            assert isinstance(trainer.fit_loop.max_batches, int), "Iterable-style datasets are not supported"
-            trainer.accumulate_grad_batches = trainer.fit_loop.max_batches
+
+            trainer.accumulate_grad_batches = trainer.num_training_batches
 
     def on_train_epoch_end(self, trainer: "pl.Trainer", *args: Any) -> None:
         trainer.fit_loop._skip_backward = False
@@ -265,7 +265,7 @@ class StochasticWeightAveraging(Callback):
         if self._model_contains_batch_norm and trainer.current_epoch - 1 == self.swa_end + 1:
             # BatchNorm epoch update. Reset state
             trainer.accumulate_grad_batches = self._accumulate_grad_batches
-            trainer.fit_loop.max_batches -= 1
+            trainer.num_training_batches -= 1
             assert trainer.fit_loop.max_epochs is not None
             trainer.fit_loop.max_epochs -= 1
             self.reset_momenta()

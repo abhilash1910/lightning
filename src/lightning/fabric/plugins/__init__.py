@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@ from lightning.fabric.plugins.environments.cluster_environment import ClusterEnv
 from lightning.fabric.plugins.io.checkpoint_io import CheckpointIO
 from lightning.fabric.plugins.io.torch_io import TorchCheckpointIO
 from lightning.fabric.plugins.io.xla import XLACheckpointIO
-from lightning.fabric.plugins.precision.amp import MixedPrecision
 from lightning.fabric.plugins.precision.deepspeed import DeepSpeedPrecision
 from lightning.fabric.plugins.precision.double import DoublePrecision
 from lightning.fabric.plugins.precision.fsdp import FSDPPrecision
+from lightning.fabric.plugins.precision.native_amp import MixedPrecision
 from lightning.fabric.plugins.precision.precision import Precision
 from lightning.fabric.plugins.precision.tpu import TPUPrecision
 from lightning.fabric.plugins.precision.tpu_bf16 import TPUBf16Precision

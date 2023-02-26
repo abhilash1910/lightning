@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@ import torch
 from jsonargparse import lazy_instance
 from torch.nn import functional as F
 
-from lightning.pytorch import LightningModule
-from lightning.pytorch.cli import LightningCLI
-from lightning.pytorch.demos.mnist_datamodule import MNISTDataModule
-from lightning.pytorch.plugins import HPUPrecisionPlugin
+from pytorch_lightning import LightningModule
+from pytorch_lightning.cli import LightningCLI
+from pytorch_lightning.demos.mnist_datamodule import MNISTDataModule
+from pytorch_lightning.plugins import HPUPrecisionPlugin
 
 
 class LitClassifier(LightningModule):
@@ -63,7 +63,7 @@ if __name__ == "__main__":
             "accelerator": "hpu",
             "devices": 1,
             "max_epochs": 1,
-            "plugins": lazy_instance(HPUPrecisionPlugin, precision="16-mixed"),
+            "plugins": lazy_instance(HPUPrecisionPlugin, precision=16),
         },
         run=False,
         save_config_kwargs={"overwrite": True},

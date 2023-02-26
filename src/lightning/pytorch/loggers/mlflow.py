@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,23 +22,22 @@ import tempfile
 from argparse import Namespace
 from pathlib import Path
 from time import time
-from typing import Any, Dict, List, Literal, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import yaml
 from lightning_utilities.core.imports import RequirementCache
 from torch import Tensor
+from typing_extensions import Literal
 
 from lightning.fabric.utilities.logger import _add_prefix, _convert_params, _flatten_dict
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
 from lightning.pytorch.loggers.logger import Logger, rank_zero_experiment
-from lightning.pytorch.loggers.utilities import _scan_checkpoints
+from lightning.pytorch.utilities.logger import _scan_checkpoints
 from lightning.pytorch.utilities.rank_zero import rank_zero_only, rank_zero_warn
 
 log = logging.getLogger(__name__)
 LOCAL_FILE_URI_PREFIX = "file:"
-_MLFLOW_FULL_AVAILABLE = RequirementCache("mlflow>=1.0.0")
-_MLFLOW_SKINNY_AVAILABLE = RequirementCache("mlflow-skinny>=1.0.0")
-_MLFLOW_AVAILABLE = _MLFLOW_FULL_AVAILABLE or _MLFLOW_SKINNY_AVAILABLE
+_MLFLOW_AVAILABLE = RequirementCache("mlflow>=1.0.0")
 if _MLFLOW_AVAILABLE:
     from mlflow.entities import Metric, Param
     from mlflow.tracking import context, MlflowClient
@@ -79,7 +78,7 @@ class MLFlowLogger(Logger):
 
     .. code-block:: bash
 
-        pip install mlflow  # or mlflow-skinny
+        pip install mlflow
 
     .. code-block:: python
 
@@ -149,9 +148,7 @@ class MLFlowLogger(Logger):
         run_id: Optional[str] = None,
     ):
         if not _MLFLOW_AVAILABLE:
-            raise ModuleNotFoundError(
-                f"{_MLFLOW_FULL_AVAILABLE!s}. You can also try {_MLFLOW_SKINNY_AVAILABLE.requirement!r}"
-            )
+            raise ModuleNotFoundError(str(_MLFLOW_AVAILABLE))
         super().__init__()
         if not tracking_uri:
             tracking_uri = f"{LOCAL_FILE_URI_PREFIX}{save_dir}"
@@ -241,14 +238,18 @@ class MLFlowLogger(Logger):
     def log_hyperparams(self, params: Union[Dict[str, Any], Namespace]) -> None:
         params = _convert_params(params)
         params = _flatten_dict(params)
+        params_list: List[Param] = []
 
-        # Truncate parameter values to 250 characters.
-        # TODO: MLflow 1.28 allows up to 500 characters: https://github.com/mlflow/mlflow/releases/tag/v1.28.0
-        params_list = [Param(key=k, value=str(v)[:250]) for k, v in params.items()]
+        for k, v in params.items():
+            # TODO: mlflow 1.28 allows up to 500 characters: https://github.com/mlflow/mlflow/releases/tag/v1.28.0
+            if len(str(v)) > 250:
+                rank_zero_warn(
+                    f"Mlflow only allows parameters with up to 250 characters. Discard {k}={v}", category=RuntimeWarning
+                )
+                continue
+            params_list.append(Param(key=v, value=v))
 
-        # Log in chunks of 100 parameters (the maximum allowed by MLflow).
-        for idx in range(0, len(params_list), 100):
-            self.experiment.log_batch(run_id=self.run_id, params=params_list[idx : idx + 100])
+        self.experiment.log_batch(run_id=self.run_id, params=params_list)
 
     @rank_zero_only
     def log_metrics(self, metrics: Mapping[str, float], step: Optional[int] = None) -> None:
@@ -283,8 +284,6 @@ class MLFlowLogger(Logger):
             status = "FINISHED"
         elif status == "failed":
             status = "FAILED"
-        elif status == "finished":
-            status = "FINISHED"
 
         # log checkpoints as artifacts
         if self._checkpoint_callback:

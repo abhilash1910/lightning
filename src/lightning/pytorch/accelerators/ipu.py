@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,20 +14,10 @@
 from typing import Any, Dict, List
 
 import torch
-from lightning_utilities.core.imports import package_available
 
 from lightning.fabric.utilities.types import _DEVICE
 from lightning.pytorch.accelerators.accelerator import Accelerator
-
-_POPTORCH_AVAILABLE = package_available("poptorch")
-
-if _POPTORCH_AVAILABLE:
-    import poptorch
-
-    _IPU_AVAILABLE = poptorch.ipuHardwareIsAvailable()
-else:
-    poptorch = None
-    _IPU_AVAILABLE = False
+from lightning.pytorch.utilities.imports import _IPU_AVAILABLE
 
 
 class IPUAccelerator(Accelerator):

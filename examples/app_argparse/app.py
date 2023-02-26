@@ -18,7 +18,7 @@ class Flow(L.LightningFlow):
 
     def run(self):
         assert self.work.cloud_compute.name == "gpu", self.work.cloud_compute.name
-        self.stop()
+        self._exit()
 
 
 if __name__ == "__main__":

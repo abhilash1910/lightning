@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol, runtime_checkable, TypeVar, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, TypeVar, Union
 
 import torch
 from torch import Tensor
 from torch.optim import Optimizer
+from typing_extensions import Protocol, runtime_checkable
+from deepspeed.accelerator.real_accelerator import get_accelerator
 
 from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_1_13, _TORCH_GREATER_EQUAL_2_0
 
 _PATH = Union[str, Path]
-_DEVICE = Union[torch.device, str, int]
+_DEVICE = Union[torch.device, str, int, get_accelerator().device_name()]
 _MAP_LOCATION_TYPE = Optional[Union[_DEVICE, Callable[[_DEVICE], _DEVICE], Dict[_DEVICE, _DEVICE]]]
 _PARAMETERS = Iterator[torch.nn.Parameter]
 

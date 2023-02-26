@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,11 +19,11 @@ from torch import nn
 from torch.optim import Optimizer, SGD
 from torch.utils.data import DataLoader
 
-from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_1_12
-from lightning.pytorch import LightningModule, seed_everything, Trainer
-from lightning.pytorch.callbacks import BackboneFinetuning, BaseFinetuning, ModelCheckpoint
-from lightning.pytorch.demos.boring_classes import BoringModel, RandomDataset
-from lightning.pytorch.utilities.imports import _TORCH_GREATER_EQUAL_1_13
+from lightning_fabric.utilities.imports import _TORCH_GREATER_EQUAL_1_11, _TORCH_GREATER_EQUAL_1_12
+from pytorch_lightning import LightningModule, seed_everything, Trainer
+from pytorch_lightning.callbacks import BackboneFinetuning, BaseFinetuning, ModelCheckpoint
+from pytorch_lightning.demos.boring_classes import BoringModel, RandomDataset
+from pytorch_lightning.utilities.imports import _TORCH_GREATER_EQUAL_1_13
 
 
 class TestBackboneFinetuningCallback(BackboneFinetuning):
@@ -52,6 +52,11 @@ def test_finetuning_callback(tmpdir):
             self.layer = torch.nn.Linear(32, 2)
             self.backbone.has_been_used = False
 
+        def training_step(self, batch, batch_idx):
+            output = self(batch)
+            loss = self.loss(batch, output)
+            return {"loss": loss}
+
         def forward(self, x):
             self.backbone.has_been_used = True
             x = self.backbone(x)
@@ -75,7 +80,7 @@ def test_finetuning_callback(tmpdir):
 
 
 class TestBackboneFinetuningWarningCallback(BackboneFinetuning):
-    def finetune_function(self, pl_module, epoch: int, optimizer):
+    def finetune_function(self, pl_module, epoch: int, optimizer, opt_idx: int):
         """Called when the epoch begins."""
 
         if epoch == 0:
@@ -95,6 +100,11 @@ def test_finetuning_callback_warning(tmpdir):
             self.backbone = nn.Linear(32, 2, bias=False)
             self.layer = None
             self.backbone.has_been_used = False
+
+        def training_step(self, batch, batch_idx):
+            output = self(batch)
+            loss = self.loss(batch, output)
+            return {"loss": loss}
 
         def forward(self, x):
             self.backbone.has_been_used = True
@@ -211,7 +221,7 @@ class OnEpochLayerFinetuning(BaseFinetuning):
     def freeze_before_training(self, pl_module: LightningModule):
         self.freeze(pl_module.layer)
 
-    def finetune_function(self, pl_module: LightningModule, epoch: int, optimizer: Optimizer):
+    def finetune_function(self, pl_module: LightningModule, epoch: int, optimizer: Optimizer, opt_idx: int):
         self.unfreeze_and_add_param_group(pl_module.layer[epoch + 1], optimizer)
 
 
@@ -316,7 +326,7 @@ class TestCallbacksRestoreCallback(BaseFinetuning):
     def freeze_before_training(self, pl_module):
         self.freeze(pl_module.layer[:3])
 
-    def finetune_function(self, pl_module, epoch, optimizer):
+    def finetune_function(self, pl_module, epoch, optimizer, opt_idx):
         if epoch >= 1:
             self.unfreeze_and_add_param_group(pl_module.layer[epoch - 1], optimizer)
 
@@ -361,8 +371,9 @@ def test_callbacks_restore(tmpdir):
         "weight_decay": 0,
         "nesterov": False,
         "params": ["layer.3.weight", "layer.3.bias"],
-        "maximize": False,
     }
+    if _TORCH_GREATER_EQUAL_1_11:
+        expected["maximize"] = False
     if _TORCH_GREATER_EQUAL_1_12:
         expected["foreach"] = None
     if _TORCH_GREATER_EQUAL_1_13:
@@ -378,8 +389,9 @@ def test_callbacks_restore(tmpdir):
         "weight_decay": 0,
         "nesterov": False,
         "params": ["layer.0.weight", "layer.0.bias"],
-        "maximize": False,
     }
+    if _TORCH_GREATER_EQUAL_1_11:
+        expected["maximize"] = False
     if _TORCH_GREATER_EQUAL_1_12:
         expected["foreach"] = None
     if _TORCH_GREATER_EQUAL_1_13:

@@ -25,7 +25,7 @@ class RootFlow(L.LightningFlow):
     def run(self):
         self.src.run()
         self.dst.run(self.src.value)
-        self.stop("Application End!")
+        self._exit("Application End!")
 
 
 app = L.LightningApp(RootFlow())

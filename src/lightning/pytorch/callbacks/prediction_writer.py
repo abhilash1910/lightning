@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@ BasePredictionWriter
 
 Aids in saving predictions
 """
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, Optional, Sequence
+
+from typing_extensions import Literal
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks.callback import Callback
@@ -136,14 +138,16 @@ class BasePredictionWriter(Callback):
         outputs: Any,
         batch: Any,
         batch_idx: int,
-        dataloader_idx: int = 0,
+        dataloader_idx: int,
     ) -> None:
         if not self.interval.on_batch:
             return
-        batch_indices = trainer.predict_loop.current_batch_indices
+        batch_indices = trainer.predict_loop.epoch_loop.current_batch_indices
         self.write_on_batch_end(trainer, pl_module, outputs, batch_indices, batch, batch_idx, dataloader_idx)
 
-    def on_predict_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+    def on_predict_epoch_end(
+        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", outputs: Sequence[Any]
+    ) -> None:
         if not self.interval.on_epoch:
             return
         epoch_batch_indices = trainer.predict_loop.epoch_batch_indices

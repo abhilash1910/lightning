@@ -59,6 +59,7 @@ The simple profiler measures all the standard methods used in the training loop 
 - on_after_backward
 - optimizer_step
 - on_train_batch_end
+- training_step_end
 - on_training_end
 - etc...
 

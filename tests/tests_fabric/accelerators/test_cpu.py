@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from lightning.fabric.accelerators.cpu import _parse_cpu_cores, CPUAccelerator
+from lightning_fabric.accelerators.cpu import _parse_cpu_cores, CPUAccelerator
 
 
 def test_auto_device_count():

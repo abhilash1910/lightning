@@ -8,14 +8,14 @@ import pytest
 import requests
 from pydantic import BaseModel
 
-from lightning.app import LightningApp, LightningFlow
-from lightning.app.cli.commands.app_commands import _run_app_command
-from lightning.app.cli.connect.app import connect_app, disconnect_app
-from lightning.app.core.constants import APP_SERVER_PORT
-from lightning.app.runners import MultiProcessRuntime
-from lightning.app.testing.helpers import _RunIf
-from lightning.app.utilities.commands.base import _download_command, _validate_client_command, ClientCommand
-from lightning.app.utilities.state import AppState
+from lightning_app import LightningApp, LightningFlow
+from lightning_app.cli.commands.app_commands import _run_app_command
+from lightning_app.cli.commands.connection import connect, disconnect
+from lightning_app.core.constants import APP_SERVER_PORT
+from lightning_app.runners import MultiProcessRuntime
+from lightning_app.testing.helpers import _RunIf
+from lightning_app.utilities.commands.base import _download_command, _validate_client_command, ClientCommand
+from lightning_app.utilities.state import AppState
 
 
 class SweepConfig(BaseModel):
@@ -44,10 +44,9 @@ class FlowCommands(LightningFlow):
     def run(self):
         if self.has_sweep and len(self.names) == 1:
             sleep(1)
-            self.stop()
+            self._exit()
 
     def trigger_method(self, name: str):
-        print(name)
         self.names.append(name)
 
     def sweep(self, config: SweepConfig):
@@ -98,8 +97,7 @@ def test_validate_client_command():
     with pytest.raises(Exception, match="annotate your method"):
         _validate_client_command(ClientCommand(run_failure_1))
 
-    starts = "lightning.app".replace(".", "/")
-    with pytest.raises(Exception, match=f"{starts}/utilities/commands/base.py"):
+    with pytest.raises(Exception, match="lightning_app/utilities/commands/base.py"):
         _validate_client_command(ClientCommand(run_failure_2))
 
 
@@ -146,9 +144,9 @@ def test_configure_commands(monkeypatch):
 
     sleep(0.5)
     monkeypatch.setattr(sys, "argv", ["lightning", "user", "command", "--name=something"])
-    connect_app("localhost")
+    connect("localhost")
     _run_app_command("localhost", None)
-    sleep(2)
+    sleep(0.5)
     state = AppState()
     state._request_state()
     assert state.names == ["something"]
@@ -161,5 +159,5 @@ def test_configure_commands(monkeypatch):
         sleep(0.1)
         time_left -= 0.1
     assert process.exitcode == 0
-    disconnect_app()
+    disconnect()
     process.kill()

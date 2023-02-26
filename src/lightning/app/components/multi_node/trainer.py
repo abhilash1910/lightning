@@ -1,22 +1,10 @@
-# Copyright The Lightning AI team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import importlib
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, runtime_checkable, Type
+from typing import Any, Callable, Type
+
+from typing_extensions import Protocol, runtime_checkable
 
 from lightning.app.components.multi_node.base import MultiNode
 from lightning.app.components.multi_node.pytorch_spawn import _PyTorchSpawnRunExecutor
@@ -52,6 +40,7 @@ class _LightningTrainerRunExecutor(_PyTorchSpawnRunExecutor):
             try:
                 pkg = importlib.import_module(pkg_name)
                 trainers.append(pkg.Trainer)
+                strategies.append(pkg.strategies.DDPSpawnShardedStrategy)
                 strategies.append(pkg.strategies.DDPSpawnStrategy)
                 mps_accelerators.append(pkg.accelerators.MPSAccelerator)
             except (ImportError, ModuleNotFoundError):

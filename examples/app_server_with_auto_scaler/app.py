@@ -51,22 +51,17 @@ class PyTorchServer(L.app.components.PythonServer):
 
 class MyAutoScaler(L.app.components.AutoScaler):
     def scale(self, replicas: int, metrics: dict) -> int:
-        pending_requests = metrics["pending_requests"]
-        active_or_pending_works = replicas + metrics["pending_works"]
-
-        if active_or_pending_works == 0:
-            return 1 if pending_requests > 0 else 0
-
-        pending_requests_per_running_or_pending_work = pending_requests / active_or_pending_works
-
+        """The default scaling logic that users can override."""
         # scale out if the number of pending requests exceeds max batch size.
         max_requests_per_work = self.max_batch_size
-        if pending_requests_per_running_or_pending_work >= max_requests_per_work:
+        pending_requests_per_work = metrics["pending_requests"] / (replicas + metrics["pending_works"])
+        if pending_requests_per_work >= max_requests_per_work:
             return replicas + 1
 
         # scale in if the number of pending requests is below 25% of max_requests_per_work
         min_requests_per_work = max_requests_per_work * 0.25
-        if pending_requests_per_running_or_pending_work < min_requests_per_work:
+        pending_requests_per_work = metrics["pending_requests"] / replicas
+        if pending_requests_per_work < min_requests_per_work:
             return replicas - 1
 
         return replicas

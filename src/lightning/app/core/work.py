@@ -1,17 +1,3 @@
-# Copyright The Lightning AI team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import sys
 import time
 import warnings
@@ -343,7 +329,7 @@ class LightningWork:
 
     @property
     def has_stopped(self) -> bool:
-        """Return whether the work has stopped."""
+        """Return whether the work has started."""
         return self.status.stage == WorkStageStatus.STOPPED
 
     @property
@@ -639,10 +625,7 @@ class LightningWork:
         return WorkStatus(**status, count=len(timeout_statuses))
 
     def on_exit(self):
-        """Override this hook to add your logic when the work is exiting.
-
-        Note: This hook is not guaranteed to be called when running in the cloud.
-        """
+        """Override this hook to add your logic when the work is exiting."""
         pass
 
     def stop(self):

@@ -1,8 +1,8 @@
-from lightning.app.core.app import LightningApp
-from lightning.app.core.flow import LightningFlow
-from lightning.app.core.work import LightningWork
-from lightning.app.frontend.web import StaticWebFrontend
-from lightning.app.utilities.packaging.cloud_compute import CloudCompute
+from lightning_app.core.app import LightningApp
+from lightning_app.core.flow import LightningFlow
+from lightning_app.core.work import LightningWork
+from lightning_app.frontend.web import StaticWebFrontend
+from lightning_app.utilities.packaging.cloud_compute import CloudCompute
 
 
 class WorkA(LightningWork):
@@ -55,7 +55,7 @@ class RootFlow(LightningFlow):
         self.flow_b = FlowB()
 
     def run(self):
-        self.stop()
+        self._exit()
 
 
 app = LightningApp(RootFlow())

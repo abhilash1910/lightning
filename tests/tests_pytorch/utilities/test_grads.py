@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from lightning.pytorch.utilities import grad_norm
+from pytorch_lightning.utilities import grad_norm
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@
 import logging
 import os
 from datetime import timedelta
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.distributed
 from torch import Tensor
 from torch.nn import Module
 from torch.nn.parallel.distributed import DistributedDataParallel
+from typing_extensions import Literal
 
 import lightning.pytorch as pl
 from lightning.fabric.plugins import CheckpointIO, ClusterEnvironment
@@ -32,9 +33,11 @@ from lightning.fabric.utilities.distributed import (
     _sync_ddp_if_available,
 )
 from lightning.fabric.utilities.distributed import group as _group
+from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_1_11
 from lightning.fabric.utilities.optimizer import _optimizers_to_device
 from lightning.fabric.utilities.types import ReduceOp
-from lightning.pytorch.overrides.base import _LightningModuleWrapperBase, _LightningPrecisionModuleWrapperBase
+from lightning.pytorch.overrides import LightningDistributedModule
+from lightning.pytorch.overrides.base import _LightningPrecisionModuleWrapperBase
 from lightning.pytorch.overrides.distributed import prepare_for_backward
 from lightning.pytorch.plugins.precision import PrecisionPlugin
 from lightning.pytorch.strategies.launchers.multiprocessing import _MultiProcessingLauncher
@@ -42,7 +45,6 @@ from lightning.pytorch.strategies.parallel import ParallelStrategy
 from lightning.pytorch.strategies.strategy import TBroadcast
 from lightning.pytorch.trainer.states import TrainerFn
 from lightning.pytorch.utilities.distributed import register_ddp_comm_hook
-from lightning.pytorch.utilities.exceptions import _augment_message
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_only
 from lightning.pytorch.utilities.types import PredictStep, STEP_OUTPUT, TestStep, ValidationStep
 
@@ -51,10 +53,8 @@ log = logging.getLogger(__name__)
 _DDP_FORK_ALIASES = (
     "ddp_fork",
     "ddp_fork_find_unused_parameters_false",
-    "ddp_fork_find_unused_parameters_true",
     "ddp_notebook",
     "ddp_notebook_find_unused_parameters_false",
-    "ddp_notebook_find_unused_parameters_true",
 )
 
 
@@ -74,7 +74,7 @@ class DDPSpawnStrategy(ParallelStrategy):
         ddp_comm_state: Optional[object] = None,
         ddp_comm_hook: Optional[Callable] = None,
         ddp_comm_wrapper: Optional[Callable] = None,
-        process_group_backend: Optional[str] = None,
+        process_group_backend: Optional[str] = "ccl",
         timeout: Optional[timedelta] = default_pg_timeout,
         start_method: Literal["spawn", "fork", "forkserver"] = "spawn",
         **kwargs: Any,
@@ -124,6 +124,10 @@ class DDPSpawnStrategy(ParallelStrategy):
         return distributed_sampler_kwargs
 
     @property
+    def _is_single_process_single_device(self) -> bool:
+        return True
+
+    @property
     def process_group_backend(self) -> Optional[str]:
         return self._process_group_backend
 
@@ -162,7 +166,7 @@ class DDPSpawnStrategy(ParallelStrategy):
         return DistributedDataParallel(module=model, device_ids=self.determine_ddp_device_ids(), **self._ddp_kwargs)
 
     def setup_distributed(self) -> None:
-        log.debug(f"{self.__class__.__name__}: setting up distributed...")
+        log.detail(f"{self.__class__.__name__}: setting up distributed...")
         self.set_world_ranks()
         rank_zero_only.rank = self.global_rank
         self._process_group_backend = self._get_process_group_backend()
@@ -185,10 +189,17 @@ class DDPSpawnStrategy(ParallelStrategy):
     def _get_process_group_backend(self) -> str:
         return self._process_group_backend or _get_default_process_group_backend_for_device(self.root_device)
 
+    def pre_configure_ddp(self) -> None:
+        # if unset, default `find_unused_parameters` `True`
+        # Many models require setting this parameter to True, as there are corner cases
+        # when not all parameter backward hooks are fired by the autograd engine even if require_grad is set to True.
+        # This flag does come with a performance hit, so it is suggested to disable in cases where it is possible.
+        self._ddp_kwargs["find_unused_parameters"] = self._ddp_kwargs.get("find_unused_parameters", True)
+
     def _register_ddp_hooks(self) -> None:
         # currently, DDP communication hooks only work with NCCL backend and SPSD (single process single device) mode
         # https://github.com/pytorch/pytorch/blob/v1.8.0/torch/nn/parallel/distributed.py#L1080-L1084
-        if self.root_device.type == "cuda":
+        if self.root_device.type == "cuda" and self._is_single_process_single_device:
             assert isinstance(self.model, DistributedDataParallel)
             register_ddp_comm_hook(
                 model=self.model,
@@ -198,8 +209,9 @@ class DDPSpawnStrategy(ParallelStrategy):
             )
 
     def configure_ddp(self) -> None:
+        self.pre_configure_ddp()
         assert isinstance(self.model, (pl.LightningModule, _LightningPrecisionModuleWrapperBase))
-        self.model = self._setup_model(_LightningModuleWrapperBase(self.model))
+        self.model = self._setup_model(LightningDistributedModule(self.model))
         self._register_ddp_hooks()
 
         # set up optimizers after the wrapped module has been moved to the device
@@ -311,41 +323,28 @@ class DDPSpawnStrategy(ParallelStrategy):
             )
 
         entries = (
-            ("ddp_spawn_find_unused_parameters_false", False, "spawn"),
-            ("ddp_spawn_find_unused_parameters_true", True, "spawn"),
-            ("ddp_fork_find_unused_parameters_false", False, "fork"),
-            ("ddp_fork_find_unused_parameters_true", True, "fork"),
-            ("ddp_notebook_find_unused_parameters_false", False, "fork"),
-            ("ddp_notebook_find_unused_parameters_true", True, "fork"),
+            ("ddp_spawn_find_unused_parameters_false", "spawn"),
+            ("ddp_fork_find_unused_parameters_false", "fork"),
+            ("ddp_notebook_find_unused_parameters_false", "fork"),
         )
-        for name, fup, start_method in entries:
+        for name, start_method in entries:
             strategy_registry.register(
                 name,
                 cls,
-                description=f"DDP strategy with `find_unused_parameters` as {fup} and `start_method` '{start_method}'",
-                find_unused_parameters=fup,
+                description=f"DDP strategy with `find_unused_parameters` as False and `start_method` '{start_method}'",
+                find_unused_parameters=False,
                 start_method=start_method,
             )
 
-    def on_exception(self, exception: BaseException) -> None:
-        _augment_message(
-            exception,
-            pattern=".*Expected to have finished reduction in the prior iteration.*",
-            new_message=(
-                "It looks like your LightningModule has parameters that were not used in producing the loss returned"
-                " by training_step. If this is intentional, you must enable the detection of unused parameters in DDP,"
-                f" either by setting the string value `strategy='ddp_{self._start_method}_find_unused_parameters_true'`"
-                " or by setting the flag in the strategy with `strategy=DDPSpawnStrategy(find_unused_parameters=True)`."
-            ),
-        )
-
     def teardown(self) -> None:
-        log.debug(f"{self.__class__.__name__}: tearing down strategy")
+        log.detail(f"{self.__class__.__name__}: tearing down strategy")
 
         pl_module = self.lightning_module
         if isinstance(self.model, DistributedDataParallel):
-            if not self.model.static_graph and self.model._get_ddp_logging_data().get(  # type: ignore[operator]
-                "can_set_static_graph"
+            if (
+                _TORCH_GREATER_EQUAL_1_11
+                and not self.model.static_graph
+                and self.model._get_ddp_logging_data().get("can_set_static_graph")  # type: ignore[operator]
             ):
                 rank_zero_info(
                     "Your model can run with static graph optimizations. For future training runs, we suggest you"

@@ -1,23 +1,25 @@
 import logging
 import time
 from multiprocessing import Process
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Optional
 
 import requests
 import torch
 from lightning_utilities.core.imports import RequirementCache
+from typing_extensions import Literal
 
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.serve.servable_module import ServableModule
-from lightning.pytorch.strategies import DeepSpeedStrategy, FSDPStrategy
+from lightning.pytorch.strategies import DDPFullyShardedNativeStrategy, DDPFullyShardedStrategy, DeepSpeedStrategy
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.model_helpers import is_overridden
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 
 _NOT_SUPPORTED_STRATEGIES = (
     DeepSpeedStrategy,
-    FSDPStrategy,
+    DDPFullyShardedNativeStrategy,
+    DDPFullyShardedStrategy,
 )
 
 _logger = logging.getLogger(__name__)

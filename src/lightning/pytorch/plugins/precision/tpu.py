@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,13 +40,14 @@ class TPUPrecisionPlugin(PrecisionPlugin):
         self,
         optimizer: Optimizable,
         model: "pl.LightningModule",
+        optimizer_idx: int,
         closure: Callable[[], Any],
         **kwargs: Any,
     ) -> Any:
         import torch_xla.core.xla_model as xm
 
         closure = partial(self._tpu_wrap_closure, optimizer, closure)
-        closure = partial(self._wrap_closure, model, optimizer, closure)
+        closure = partial(self._wrap_closure, model, optimizer, optimizer_idx, closure)
         closure_result = optimizer.step(closure=closure, **kwargs)
         xm.mark_step()
         skipped_backward = closure_result is None

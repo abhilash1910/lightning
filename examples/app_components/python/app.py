@@ -1,9 +1,8 @@
 import os
 from pathlib import Path
 
-from examples.components.python.component_tracer import PLTracerPythonScript
-
 import lightning as L
+from examples.components.python.component_tracer import PLTracerPythonScript
 
 
 class RootFlow(L.LightningFlow):
@@ -17,9 +16,9 @@ class RootFlow(L.LightningFlow):
         if not self.tracer_python_script.has_started:
             self.tracer_python_script.run()
         if self.tracer_python_script.has_succeeded:
-            self.stop("tracer script succeed")
+            self._exit("tracer script succeed")
         if self.tracer_python_script.has_failed:
-            self.stop("tracer script failed")
+            self._exit("tracer script failed")
 
 
 app = L.LightningApp(RootFlow())

@@ -1,17 +1,3 @@
-# Copyright The Lightning AI team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import os
 import shutil
 import sys
@@ -33,25 +19,17 @@ from lightning.app.cli import cmd_init, cmd_install, cmd_pl_init, cmd_react_ui_i
 from lightning.app.cli.cmd_apps import _AppManager
 from lightning.app.cli.cmd_clusters import AWSClusterManager
 from lightning.app.cli.commands.app_commands import _run_app_command
-from lightning.app.cli.commands.cd import cd
-from lightning.app.cli.commands.cp import cp
-from lightning.app.cli.commands.logs import logs
-from lightning.app.cli.commands.ls import ls
-from lightning.app.cli.commands.pwd import pwd
-from lightning.app.cli.commands.rm import rm
-from lightning.app.cli.connect.app import (
+from lightning.app.cli.commands.connection import (
     _list_app_commands,
     _retrieve_connection_to_an_app,
-    connect_app,
-    disconnect_app,
+    connect,
+    disconnect,
 )
-from lightning.app.cli.connect.data import connect_data
-from lightning.app.cli.connect.maverick import connect_maverick, disconnect_maverick
+from lightning.app.cli.commands.logs import logs
 from lightning.app.cli.lightning_cli_create import create
 from lightning.app.cli.lightning_cli_delete import delete
 from lightning.app.cli.lightning_cli_list import get_list
 from lightning.app.core.constants import DEBUG, ENABLE_APP_COMMENT_COMMAND_EXECUTION, get_lightning_cloud_url
-from lightning.app.runners.cloud import CloudRuntime
 from lightning.app.runners.runtime import dispatch
 from lightning.app.runners.runtime_type import RuntimeType
 from lightning.app.utilities.app_commands import run_app_commands
@@ -124,28 +102,8 @@ def show() -> None:
     pass
 
 
-@_main.group()
-def connect() -> None:
-    """Connect apps and data."""
-    pass
-
-
-@_main.group()
-def disconnect() -> None:
-    """Disconnect apps."""
-    pass
-
-
-connect.command("app")(connect_app)
-disconnect.command("app")(disconnect_app)
-connect.command("maverick", hidden=True)(connect_maverick)
-disconnect.command("maverick", hidden=True)(disconnect_maverick)
-connect.command("data", hidden=True)(connect_data)
-_main.command(hidden=True)(ls)
-_main.command(hidden=True)(cd)
-_main.command(hidden=True)(cp)
-_main.command(hidden=True)(pwd)
-_main.command(hidden=True)(rm)
+_main.command()(connect)
+_main.command()(disconnect)
 show.command()(logs)
 
 
@@ -200,7 +158,7 @@ def cluster_logs(cluster_id: str, to_time: arrow.Arrow, from_time: arrow.Arrow, 
             $ lightning show cluster logs my-cluster --limit 10
     """
 
-    client = LightningClient(retry=False)
+    client = LightningClient()
     cluster_manager = AWSClusterManager()
     existing_cluster_list = cluster_manager.get_clusters()
 
@@ -259,7 +217,7 @@ def login() -> None:
 def logout() -> None:
     """Log out of your lightning.ai account."""
     Auth().clear()
-    disconnect_app(logout=True)
+    disconnect(logout=True)
 
 
 def _run_app(
@@ -416,32 +374,11 @@ def run_app(
     )
 
 
-if RequirementCache("lightning-fabric>=1.9.0") or RequirementCache("lightning>=1.9.0"):
-    # note it is automatically replaced to `from lightning.fabric.cli` when building monolithic/mirror package
+if RequirementCache("lightning-fabric>=1.9.0.dev0") or RequirementCache("lightning>=1.9.0.dev0"):
+    # lightning.fabric.cli may not be available when installing only standalone lightning-app package
     from lightning.fabric.cli import _run_model
 
     run.add_command(_run_model)
-
-
-@_main.command("open", hidden=True)
-@click.argument("path", type=str, default=".")
-@click.option(
-    "--cluster-id",
-    type=str,
-    default=None,
-    help="Open on a specific Lightning AI BYOC compute cluster",
-)
-@click.option("--name", help="The name to use for the CloudSpace", default="", type=str)
-def open(path: str, cluster_id: str, name: str) -> None:
-    """Open files or folders from your machine in a Lightning CloudSpace."""
-
-    if not os.path.exists(path):
-        click.echo(f"The provided path `{path}` doesn't exist.")
-        sys.exit(1)
-
-    runtime = CloudRuntime(entrypoint=Path(path))
-    runtime.open(name, cluster_id)
-
 
 _main.add_command(get_list)
 _main.add_command(delete)

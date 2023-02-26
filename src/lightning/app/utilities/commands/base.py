@@ -1,17 +1,3 @@
-# Copyright The Lightning AI team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import errno
 import inspect
 import os
@@ -121,7 +107,7 @@ def _download_command(
     if not debug_mode:
         if app_id:
             if not os.path.exists(target_file):
-                client = LightningClient(retry=False)
+                client = LightningClient()
                 project_id = _get_project(client).project_id
                 response = client.lightningapp_instance_service_list_lightningapp_instance_artifacts(
                     project_id=project_id, id=app_id
@@ -139,11 +125,7 @@ def _download_command(
     mod = module_from_spec(spec)
     sys.modules[cls_name] = mod
     spec.loader.exec_module(mod)
-    command_type = getattr(mod, cls_name)
-    if issubclass(command_type, ClientCommand):
-        command = command_type(method=None)
-    else:
-        raise ValueError(f"Expected class {cls_name} for command {command_name} to be a `ClientCommand`.")
+    command = getattr(mod, cls_name)(method=None)
     if tmpdir and os.path.exists(tmpdir):
         shutil.rmtree(tmpdir)
     return command
@@ -186,11 +168,12 @@ def _validate_client_command(command: ClientCommand):
             )
 
 
-def _upload(name: str, prefix: str, obj: Any) -> Optional[str]:
+def _upload_command(command_name: str, command: ClientCommand) -> Optional[str]:
     from lightning.app.storage.path import _filesystem, _is_s3fs_available, _shared_storage_path
 
-    name = name.replace(" ", "_")
-    filepath = f"{prefix}/{name}.py"
+    command_name = command_name.replace(" ", "_")
+    filepath = f"commands/{command_name}.py"
+    remote_url = str(_shared_storage_path() / "artifacts" / filepath)
     fs = _filesystem()
 
     if _is_s3fs_available():
@@ -199,7 +182,7 @@ def _upload(name: str, prefix: str, obj: Any) -> Optional[str]:
         if not isinstance(fs, S3FileSystem):
             return
 
-        source_file = str(inspect.getfile(obj.__class__))
+        source_file = str(inspect.getfile(command.__class__))
         remote_url = str(_shared_storage_path() / "artifacts" / filepath)
         fs.put(source_file, remote_url)
         return filepath
@@ -214,7 +197,7 @@ def _prepare_commands(app) -> List:
     for command_mapping in commands:
         for command_name, command in command_mapping.items():
             if isinstance(command, ClientCommand):
-                _upload(command_name, "commands", command)
+                _upload_command(command_name, command)
 
     # 2: Cache the commands on the app.
     app.commands = commands

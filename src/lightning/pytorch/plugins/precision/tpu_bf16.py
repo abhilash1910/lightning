@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Any, List, Literal, Tuple
+from typing import Any, List, Tuple
 
 import torch.nn as nn
 from torch.optim import Optimizer
@@ -23,7 +23,7 @@ from lightning.pytorch.plugins.precision import TPUPrecisionPlugin
 class TPUBf16PrecisionPlugin(TPUPrecisionPlugin):
     """Plugin that enables bfloats on TPUs."""
 
-    precision: Literal["bf16-mixed"] = "bf16-mixed"
+    precision: str = "bf16"
 
     def connect(
         self, model: nn.Module, optimizers: List[Optimizer], lr_schedulers: List[Any]

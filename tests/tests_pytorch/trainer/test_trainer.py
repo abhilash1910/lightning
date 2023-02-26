@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +17,10 @@ import math
 import os
 import pickle
 from argparse import Namespace
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
-from unittest import mock
+from re import escape
 from unittest.mock import ANY, call, Mock, patch
 
 import cloudpickle
@@ -32,28 +32,37 @@ from torch.nn.parallel.distributed import DistributedDataParallel
 from torch.optim import SGD
 from torch.utils.data import DataLoader, IterableDataset
 
-import lightning.pytorch
+import pytorch_lightning
 import tests_pytorch.helpers.utils as tutils
-from lightning.fabric.utilities.cloud_io import _load as pl_load
-from lightning.fabric.utilities.seed import seed_everything
-from lightning.pytorch import Callback, LightningDataModule, LightningModule, Trainer
-from lightning.pytorch.accelerators import CPUAccelerator, CUDAAccelerator
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, Timer
-from lightning.pytorch.callbacks.on_exception_checkpoint import OnExceptionCheckpoint
-from lightning.pytorch.callbacks.prediction_writer import BasePredictionWriter
-from lightning.pytorch.core.saving import load_hparams_from_tags_csv, load_hparams_from_yaml, save_hparams_to_tags_csv
-from lightning.pytorch.demos.boring_classes import (
+from lightning_fabric.utilities.cloud_io import _load as pl_load
+from lightning_fabric.utilities.seed import seed_everything
+from pytorch_lightning import Callback, LightningDataModule, LightningModule, Trainer
+from pytorch_lightning.accelerators import CPUAccelerator, CUDAAccelerator
+from pytorch_lightning.callbacks import EarlyStopping, GradientAccumulationScheduler, ModelCheckpoint, Timer
+from pytorch_lightning.callbacks.fault_tolerance import _FaultToleranceCheckpoint
+from pytorch_lightning.callbacks.prediction_writer import BasePredictionWriter
+from pytorch_lightning.core.saving import load_hparams_from_tags_csv, load_hparams_from_yaml, save_hparams_to_tags_csv
+from pytorch_lightning.demos.boring_classes import (
+    BoringDataModule,
     BoringModel,
     RandomDataset,
     RandomIterableDataset,
     RandomIterableDatasetWithLen,
 )
-from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.overrides.distributed import _IndexBatchSamplerWrapper, UnrepeatedDistributedSampler
-from lightning.pytorch.strategies import DDPSpawnStrategy, DDPStrategy, SingleDeviceStrategy
-from lightning.pytorch.trainer.states import RunningStage, TrainerFn
-from lightning.pytorch.utilities.exceptions import MisconfigurationException
-from lightning.pytorch.utilities.imports import _OMEGACONF_AVAILABLE
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.overrides.distributed import IndexBatchSamplerWrapper, UnrepeatedDistributedSampler
+from pytorch_lightning.strategies import (
+    DataParallelStrategy,
+    DDPFullyShardedStrategy,
+    DDPShardedStrategy,
+    DDPSpawnShardedStrategy,
+    DDPSpawnStrategy,
+    DDPStrategy,
+    SingleDeviceStrategy,
+)
+from pytorch_lightning.trainer.states import RunningStage, TrainerFn
+from pytorch_lightning.utilities.exceptions import DeadlockDetectedException, MisconfigurationException
+from pytorch_lightning.utilities.imports import _OMEGACONF_AVAILABLE
 from tests_pytorch.conftest import mock_cuda_count, mock_mps_count
 from tests_pytorch.helpers.datamodules import ClassifDataModule
 from tests_pytorch.helpers.runif import RunIf
@@ -69,9 +78,13 @@ def test_trainer_error_when_input_not_lightning_module():
     trainer = Trainer()
 
     for method in ("fit", "validate", "test", "predict"):
-        with pytest.raises(TypeError, match="must be a `LightningModule`.*got `Linear"):
+        with pytest.raises(TypeError, match=escape(f"`Trainer.{method}()` requires a `LightningModule`, got: Linear")):
             run_method = getattr(trainer, method)
             run_method(nn.Linear(2, 2))
+
+    trainer = Trainer(auto_lr_find=True, auto_scale_batch_size=True)
+    with pytest.raises(TypeError, match=escape("`Trainer.tune()` requires a `LightningModule`, got: Linear")):
+        trainer.tune(nn.Linear(2, 2))
 
 
 @pytest.mark.parametrize("url_ckpt", [True, False])
@@ -170,9 +183,23 @@ def test_strict_model_load(monkeypatch, tmpdir, tmpdir_server, url_ckpt):
     assert not failed, "Model should be loaded due to strict=False."
 
 
+def test_trainer_accumulate_grad_batches_incorrect_value(tmpdir):
+    with pytest.raises(MisconfigurationException, match=".*should be an int or a dict.*"):
+        Trainer(default_root_dir=tmpdir, accumulate_grad_batches=(2, 5))
+
+
+def test_trainer_accumulate_grad_batches_with_grad_acc_callback(tmpdir):
+    with pytest.raises(
+        MisconfigurationException, match=".*set both `accumulate_grad_batches` and passed an instance.*"
+    ):
+        Trainer(default_root_dir=tmpdir, accumulate_grad_batches=7, callbacks=[GradientAccumulationScheduler({0: 2})])
+
+
 @pytest.mark.parametrize(
     ["accumulate_grad_batches", "limit_train_batches"],
     [
+        ({1: 2, 3: 4}, 1.0),
+        ({1: 2, 3: 4}, 0.5),  # not to be divisible by accumulate_grad_batches on purpose
         (3, 1.0),
         (3, 0.8),  # not to be divisible by accumulate_grad_batches on purpose
         (4, 1.0),
@@ -326,7 +353,7 @@ def test_model_checkpoint_options(tmpdir, save_top_k, save_last, expected_files)
     # emulate callback's calls during the training
     for i, loss in enumerate(losses, 1):
         # sets `trainer.global_step`
-        trainer.fit_loop.epoch_loop.automatic_optimization.optim_progress.optimizer.step.total.completed = i
+        trainer.fit_loop.epoch_loop.batch_loop.optimizer_loop.optim_progress.optimizer.step.total.completed = i
         trainer.callback_metrics.update({"checkpoint_on": torch.tensor(loss)})
         checkpoint_callback.on_validation_end(trainer, trainer.lightning_module)
         trainer.fit_loop.epoch_progress.current.completed = i  # sets `trainer.current_epoch`
@@ -608,7 +635,7 @@ def test_trainer_min_steps_and_min_epochs_not_reached(tmpdir, caplog):
         limit_train_batches=2,
         callbacks=[early_stop],
     )
-    with caplog.at_level(logging.INFO, logger="lightning.pytorch.trainer.trainer"):
+    with caplog.at_level(logging.INFO, logger="pytorch_lightning.trainer.trainer"):
         trainer.fit(model)
 
     message = f"min_epochs={min_epochs}` or `min_steps=None` has not been met. Training will continue"
@@ -638,13 +665,45 @@ def test_trainer_max_steps_accumulate_batches(tmpdir):
     assert trainer.global_step == trainer.max_steps, "Model did not stop at max_steps"
 
 
+@pytest.mark.parametrize("cudnn_benchmark", (False, True))
+@pytest.mark.parametrize(
+    ["benchmark_", "deterministic", "expected"],
+    [
+        (None, False, None),
+        (None, True, False),
+        (None, None, None),
+        (True, False, True),
+        (True, True, True),
+        (True, None, True),
+        (False, False, False),
+        (False, True, False),
+        (False, None, False),
+    ],
+)
+def test_benchmark_option(cudnn_benchmark, benchmark_, deterministic, expected):
+    """Verify benchmark option."""
+    original_val = torch.backends.cudnn.benchmark
+
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    if benchmark_ and deterministic:
+        with pytest.warns(UserWarning, match="You passed `deterministic=True` and `benchmark=True`"):
+            trainer = Trainer(benchmark=benchmark_, deterministic=deterministic)
+    else:
+        trainer = Trainer(benchmark=benchmark_, deterministic=deterministic)
+    expected = cudnn_benchmark if expected is None else expected
+    assert torch.backends.cudnn.benchmark == expected
+    assert trainer._accelerator_connector.benchmark == expected
+
+    torch.backends.cudnn.benchmark = original_val
+
+
 @pytest.mark.parametrize("ckpt_path", (None, "last"))
 @pytest.mark.parametrize("fn", (TrainerFn.FITTING, TrainerFn.VALIDATING))
 def test_checkpoint_path_input_last_fault_tolerant(tmpdir, ckpt_path, fn):
     mc = ModelCheckpoint()
     mc.best_model_path = "foobar"
     # manually create to simulate fault-tolerant training
-    ft_ckpt = OnExceptionCheckpoint(tmpdir)
+    ft_ckpt = _FaultToleranceCheckpoint(tmpdir)
     Path(ft_ckpt.ckpt_path).touch()
 
     trainer = Trainer(callbacks=[mc, ft_ckpt])
@@ -652,16 +711,16 @@ def test_checkpoint_path_input_last_fault_tolerant(tmpdir, ckpt_path, fn):
 
     if ckpt_path == "last":
         ctxt = nullcontext()
-        final_path = os.path.join(tmpdir, "on_exception.ckpt")
+        final_path = os.path.join(tmpdir, ".pl_auto_save.ckpt")
     elif fn == "fit":  # and ckpt_path == best
-        ctxt = pytest.warns(UserWarning, match="The last model of the previous `fit")
-        final_path = os.path.join(tmpdir, "on_exception.ckpt")
+        ctxt = pytest.warns(UserWarning, match="Because fault tolerance is enabled")
+        final_path = os.path.join(tmpdir, ".pl_auto_save.ckpt")
     else:  # ckpt_path == best and fn == validate
-        ctxt = pytest.warns(UserWarning, match="There is also an on-exception checkpoint available")
+        ctxt = pytest.warns(UserWarning, match="There is also a fault-tolerant checkpoint available")
         final_path = "foobar"
 
     with ctxt:
-        ckpt_path = trainer._checkpoint_connector._parse_ckpt_path(
+        ckpt_path = trainer._checkpoint_connector._set_ckpt_path(
             fn, ckpt_path, model_provided=fn == "fit", model_connected=True
         )
     assert ckpt_path == final_path
@@ -763,6 +822,7 @@ def test_checkpoint_path_input(tmpdir, ckpt_path, save_top_k, fn):
             return self(batch)
 
     model = TestModel()
+    model.test_epoch_end = None
     trainer = Trainer(
         max_epochs=2,
         limit_val_batches=1,
@@ -799,7 +859,7 @@ def test_checkpoint_path_input(tmpdir, ckpt_path, save_top_k, fn):
             # ckpt_path is None with no model provided means load the best weights
             with pytest.warns(UserWarning, match="The best model of the previous `fit` call will be used"):
                 trainer_fn(ckpt_path=ckpt_path)
-            assert trainer.ckpt_path == trainer.checkpoint_callback.best_model_path
+                assert trainer.ckpt_path == trainer.checkpoint_callback.best_model_path
     else:
         # specific checkpoint, pick one from saved ones
         if save_top_k == 0:
@@ -833,6 +893,7 @@ def test_tested_checkpoint_path_best(tmpdir, enable_checkpointing, fn):
             return self(batch)
 
     model = TestModel()
+    model.test_epoch_end = None
     trainer = Trainer(
         max_epochs=2,
         limit_val_batches=1,
@@ -872,7 +933,7 @@ def test_best_ckpt_evaluate_raises_warning_with_multiple_ckpt_callbacks():
     trainer.state.fn = TrainerFn.TESTING
 
     with pytest.warns(UserWarning, match="best checkpoint path from first checkpoint callback"):
-        trainer._checkpoint_connector._parse_ckpt_path(
+        trainer._checkpoint_connector._set_ckpt_path(
             trainer.state.fn, ckpt_path="best", model_provided=False, model_connected=True
         )
 
@@ -883,10 +944,15 @@ def test_disabled_training(tmpdir):
     class CurrentModel(BoringModel):
 
         training_step_invoked = False
+        training_epoch_end_invoked = False
 
         def training_step(self, *args, **kwargs):
             self.training_step_invoked = True
             return super().training_step(*args, **kwargs)
+
+        def training_epoch_end(self, *args, **kwargs):
+            self.training_epoch_end_invoked = True
+            return super().training_epoch_end(*args, **kwargs)
 
     model = CurrentModel()
 
@@ -913,6 +979,7 @@ def test_disabled_training(tmpdir):
     assert trainer.state.finished, f"Training failed with {trainer.state}"
     assert trainer.current_epoch == 0
     assert not model.training_step_invoked, "`training_step` should not run when `limit_train_batches=0`"
+    assert not model.training_epoch_end_invoked, "`training_epoch_end` should not run when `limit_train_batches=0`"
 
     # check that limit_train_batches has no influence when fast_dev_run is turned on
     model = CurrentModel()
@@ -930,6 +997,7 @@ def test_disabled_training(tmpdir):
     assert trainer.state.finished, f"Training failed with {trainer.state}"
     assert trainer.current_epoch == 1
     assert model.training_step_invoked, "did not run `training_step` with `fast_dev_run=True`"
+    assert model.training_epoch_end_invoked, "did not run `training_epoch_end` with `fast_dev_run=True`"
 
 
 def test_disabled_validation(tmpdir):
@@ -938,10 +1006,15 @@ def test_disabled_validation(tmpdir):
     class CurrentModel(BoringModel):
 
         validation_step_invoked = False
+        validation_epoch_end_invoked = False
 
         def validation_step(self, *args, **kwargs):
             self.validation_step_invoked = True
             return super().validation_step(*args, **kwargs)
+
+        def validation_epoch_end(self, *args, **kwargs):
+            self.validation_epoch_end_invoked = True
+            return super().validation_epoch_end(*args, **kwargs)
 
     model = CurrentModel()
 
@@ -961,6 +1034,7 @@ def test_disabled_validation(tmpdir):
     assert trainer.state.finished, f"Training failed with {trainer.state}"
     assert trainer.current_epoch == 2
     assert not model.validation_step_invoked, "`validation_step` should not run when `limit_val_batches=0`"
+    assert not model.validation_epoch_end_invoked, "`validation_epoch_end` should not run when `limit_val_batches=0`"
 
     # check that limit_val_batches has no influence when fast_dev_run is turned on
     model = CurrentModel()
@@ -971,6 +1045,13 @@ def test_disabled_validation(tmpdir):
     assert trainer.state.finished, f"Training failed with {trainer.state}"
     assert trainer.current_epoch == 1
     assert model.validation_step_invoked, "did not run `validation_step` with `fast_dev_run=True`"
+    assert model.validation_epoch_end_invoked, "did not run `validation_epoch_end` with `fast_dev_run=True`"
+
+
+@pytest.mark.parametrize("track_grad_norm", [0, torch.tensor(1), "nan"])
+def test_invalid_track_grad_norm(tmpdir, track_grad_norm):
+    with pytest.raises(MisconfigurationException, match="`track_grad_norm` must be a positive number or 'inf'"):
+        Trainer(default_root_dir=tmpdir, track_grad_norm=track_grad_norm)
 
 
 def test_on_exception_hook(tmpdir):
@@ -1019,7 +1100,7 @@ def test_on_exception_hook(tmpdir):
     assert isinstance(handle_interrupt_callback.exception, MisconfigurationException)
 
 
-@pytest.mark.parametrize("precision", ["32-true", pytest.param("16-mixed", marks=RunIf(min_cuda_gpus=1))])
+@pytest.mark.parametrize("precision", [32, pytest.param(16, marks=RunIf(min_cuda_gpus=1))])
 @RunIf(sklearn=True)
 def test_gradient_clipping_by_norm(tmpdir, precision):
     """Test gradient clipping by norm."""
@@ -1048,7 +1129,7 @@ def test_gradient_clipping_by_norm(tmpdir, precision):
     assert model.assertion_called
 
 
-@pytest.mark.parametrize("precision", ["32-true", pytest.param("16-mixed", marks=RunIf(min_cuda_gpus=1))])
+@pytest.mark.parametrize("precision", [32, pytest.param(16, marks=RunIf(min_cuda_gpus=1))])
 def test_gradient_clipping_by_value(tmpdir, precision):
     """Test gradient clipping by value."""
     trainer = Trainer(
@@ -1087,10 +1168,30 @@ def test_invalid_gradient_clip_algo(tmpdir):
         Trainer(default_root_dir=tmpdir, gradient_clip_algorithm="norm2")
 
 
+@RunIf(min_cuda_gpus=1)
+def test_invalid_gpu_choice_with_auto_select_gpus():
+    num_gpus = torch.cuda.device_count()
+    with pytest.raises(MisconfigurationException, match=r".*but your machine only has.*"), pytest.deprecated_call(
+        match="The function `pick_multiple_gpus` has been deprecated in v1.9.0"
+    ):
+        Trainer(accelerator="gpu", devices=num_gpus + 1, auto_select_gpus=True)
+
+
 @pytest.mark.parametrize("limit_val_batches", [0.0, 1, 1.0, 0.5, 5])
 def test_num_sanity_val_steps(tmpdir, limit_val_batches):
     """Test that the number of sanity check batches is clipped to `limit_val_batches`."""
+
+    class CustomModel(BoringModel):
+        def validation_step(self, batch, batch_idx, dataloader_idx):
+            return super().validation_step(batch, batch_idx)
+
+        def val_dataloader(self):
+            return [DataLoader(RandomDataset(32, 64)), DataLoader(RandomDataset(32, 64))]
+
+    model = CustomModel()
+    model.validation_epoch_end = None
     num_sanity_val_steps = 4
+
     trainer = Trainer(
         default_root_dir=tmpdir,
         num_sanity_val_steps=num_sanity_val_steps,
@@ -1099,22 +1200,22 @@ def test_num_sanity_val_steps(tmpdir, limit_val_batches):
     )
     assert trainer.num_sanity_val_steps == num_sanity_val_steps
 
-    class CustomModelMixedVal(BoringModel):
-        def validation_step(self, batch, batch_idx, dataloader_idx):
-            return super().validation_step(batch, batch_idx)
-
+    class CustomModelMixedVal(CustomModel):
         def val_dataloader(self):
             return [DataLoader(RandomDataset(32, 64), batch_size=8), DataLoader(RandomDataset(32, 64))]
 
     model = CustomModelMixedVal()
+    model.validation_epoch_end = None
 
     with patch.object(
-        trainer.fit_loop.epoch_loop.val_loop,
+        trainer.fit_loop.epoch_loop.val_loop.epoch_loop,
         "_evaluation_step",
-        wraps=trainer.fit_loop.epoch_loop.val_loop._evaluation_step,
+        wraps=trainer.fit_loop.epoch_loop.val_loop.epoch_loop._evaluation_step,
     ) as mocked:
         trainer.fit(model)
-    assert mocked.call_count == sum(trainer.num_sanity_val_batches)
+        assert mocked.call_count == sum(
+            min(num_sanity_val_steps, num_batches) for num_batches in trainer.num_val_batches
+        )
 
 
 @pytest.mark.parametrize("limit_val_batches", [0.0, 1, 1.0, 0.3])
@@ -1130,15 +1231,16 @@ def test_num_sanity_val_steps_neg_one(tmpdir, limit_val_batches):
             return [DataLoader(RandomDataset(32, 64)), DataLoader(RandomDataset(32, 64))]
 
     model = CustomModel()
+    model.validation_epoch_end = None
     trainer = Trainer(
         default_root_dir=tmpdir, num_sanity_val_steps=-1, limit_val_batches=limit_val_batches, max_steps=1
     )
     assert trainer.num_sanity_val_steps == float("inf")
 
     with patch.object(
-        trainer.fit_loop.epoch_loop.val_loop,
+        trainer.fit_loop.epoch_loop.val_loop.epoch_loop,
         "_evaluation_step",
-        wraps=trainer.fit_loop.epoch_loop.val_loop._evaluation_step,
+        wraps=trainer.fit_loop.epoch_loop.val_loop.epoch_loop._evaluation_step,
     ) as mocked:
         val_dataloaders = model.val_dataloader()
         trainer.fit(model, val_dataloaders=val_dataloaders)
@@ -1227,7 +1329,7 @@ def test_trainer_setup_call(tmpdir, stage):
 
 
 @pytest.mark.parametrize("train_batches, max_steps, log_interval", [(10, 10, 1), (3, 10, 1), (3, 10, 5)])
-@patch("lightning.pytorch.loggers.tensorboard.TensorBoardLogger.log_metrics")
+@patch("pytorch_lightning.loggers.tensorboard.TensorBoardLogger.log_metrics")
 def test_log_every_n_steps(log_metrics_mock, tmpdir, train_batches, max_steps, log_interval):
     class TestModel(BoringModel):
         def training_step(self, *args, **kwargs):
@@ -1269,7 +1371,7 @@ class CustomPredictionWriter(BasePredictionWriter):
         super().__init__(*args, **kwargs)
         self.output_dir = output_dir
 
-    def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, *_):
+    def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, *args, **kwargs):
         assert prediction.shape == torch.Size([1, 2])
         assert len(batch_indices) == 1
         self.write_on_batch_end_called = True
@@ -1282,19 +1384,19 @@ class CustomPredictionWriter(BasePredictionWriter):
         assert len(batch_indices[0]) == expected
         self.write_on_epoch_end_called = True
 
-    def on_predict_epoch_end(self, trainer, pl_module):
+    def on_predict_epoch_end(self, trainer, pl_module, outputs):
         if trainer._accelerator_connector.is_distributed:
             for idx in range(2):
                 assert isinstance(trainer.predict_dataloaders[idx].batch_sampler.sampler, UnrepeatedDistributedSampler)
-                assert isinstance(trainer.predict_dataloaders[idx].batch_sampler, _IndexBatchSamplerWrapper)
-        super().on_predict_epoch_end(trainer, pl_module)
+                assert isinstance(trainer.predict_dataloaders[idx].batch_sampler, IndexBatchSamplerWrapper)
+        super().on_predict_epoch_end(trainer, pl_module, outputs)
 
 
 def predict(
     tmpdir,
-    strategy="auto",
-    accelerator="auto",
-    devices="auto",
+    strategy=None,
+    accelerator=None,
+    devices=None,
     model=None,
     plugins=None,
     datamodule=True,
@@ -1380,6 +1482,8 @@ def test_trainer_predict_cpu(tmpdir, datamodule, enable_progress_bar):
 @pytest.mark.parametrize(
     "kwargs",
     [
+        {"strategy": "dp", "devices": 1},
+        {"strategy": "dp", "devices": 2},
         {"strategy": "ddp", "devices": 2},
     ],
 )
@@ -1416,7 +1520,7 @@ def test_index_batch_sampler_wrapper_with_iterable_dataset(dataset_cls, tmpdir):
             super().__init__(*args, **kwargs)
             self.output_dir = output_dir
 
-        def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, *_):
+        def write_on_batch_end(self, trainer, pl_module, prediction, batch_indices, *args, **kwargs):
             assert not batch_indices if is_iterable_dataset else batch_indices
 
     cb = CustomPredictionWriter(tmpdir)
@@ -1435,7 +1539,7 @@ def test_spawn_predict_return_predictions(tmpdir):
 
 
 @pytest.mark.parametrize("return_predictions", [None, False, True])
-@pytest.mark.parametrize("precision", ["32-true", "64-true"])
+@pytest.mark.parametrize("precision", [32, 64])
 def test_predict_return_predictions_cpu(return_predictions, precision, tmpdir):
     """Test that `return_predictions=True`."""
     seed_everything(42)
@@ -1446,7 +1550,7 @@ def test_predict_return_predictions_cpu(return_predictions, precision, tmpdir):
     if return_predictions or return_predictions is None:
         assert len(preds) == 1
         assert preds[0].shape == torch.Size([1, 2])
-        assert preds[0].dtype == (torch.float64 if precision == "64-true" else torch.float32)
+        assert preds[0].dtype == (torch.float64 if precision == 64 else torch.float32)
 
 
 @pytest.mark.parametrize(["max_steps", "max_epochs", "global_step"], [(10, 5, 10), (20, None, 20)])
@@ -1501,7 +1605,7 @@ def test_setup_hook_move_to_device_correctly(tmpdir, accelerator):
             output = self.layer(batch)
             # will crash if not moved to correct device
             output = self.new_layer(output)
-            loss = self.loss(output)
+            loss = self.loss(batch, output)
             return {"loss": loss}
 
     # fake data
@@ -1606,7 +1710,7 @@ def test_exception_when_testing_or_validating_with_fast_dev_run():
     trainer = Trainer(fast_dev_run=True)
     trainer.state.fn = TrainerFn.TESTING
     with pytest.raises(ValueError, match=r"with `fast_dev_run=True`. .* pass an exact checkpoint path"):
-        trainer._checkpoint_connector._parse_ckpt_path(
+        trainer._checkpoint_connector._set_ckpt_path(
             trainer.state.fn, ckpt_path="best", model_provided=False, model_connected=True
         )
 
@@ -1629,9 +1733,7 @@ class TrainerStagesModel(BoringModel):
         assert not self.training
 
 
-@pytest.mark.parametrize(
-    "strategy,devices", [("auto", 1), pytest.param("ddp_spawn", 1, marks=RunIf(skip_windows=True))]
-)
+@pytest.mark.parametrize("strategy,devices", [(None, 1), pytest.param("ddp_spawn", 1, marks=RunIf(skip_windows=True))])
 def test_model_in_correct_mode_during_stages(tmpdir, strategy, devices):
     model = TrainerStagesModel()
     trainer = Trainer(default_root_dir=tmpdir, strategy=strategy, accelerator="cpu", devices=devices, fast_dev_run=True)
@@ -1643,8 +1745,12 @@ def test_model_in_correct_mode_during_stages(tmpdir, strategy, devices):
 
 class TestDummyModelForCheckpoint(BoringModel):
     def validation_step(self, batch, batch_idx):
-        loss = self.step(batch)
+        output = self.layer(batch)
+        loss = self.loss(batch, output)
         self.log("x", loss)
+
+    def validation_epoch_end(self, outputs) -> None:
+        pass
 
 
 @RunIf(skip_windows=True)
@@ -1696,12 +1802,50 @@ def test_module_current_fx_attributes_reset(tmpdir):
     assert model._current_fx_name is None
 
 
-@pytest.mark.parametrize("fn", ("validate", "test", "predict"))
-def test_exception_when_lightning_module_is_not_set_on_trainer(fn):
+def test_exception_when_lightning_module_is_not_set_on_trainer():
     trainer = Trainer()
-    trainer_fn = getattr(trainer, fn)
-    with pytest.raises(TypeError, match=rf"{fn}\(\)` requires a `LightningModule"):
-        trainer_fn()
+
+    with pytest.raises(MisconfigurationException, match=r"`model` must be provided.*validate"):
+        trainer.validate()
+    with pytest.raises(MisconfigurationException, match=r"`model` must be provided.*test"):
+        trainer.test()
+    with pytest.raises(MisconfigurationException, match=r"`model` must be provided.*predict"):
+        trainer.predict()
+
+
+class CustomException(Exception):
+    pass
+
+
+@RunIf(min_cuda_gpus=2, standalone=True)
+def test_ddp_terminate_when_deadlock_is_detected(tmpdir):
+    """Test that DDP kills the remaining processes when only one rank is throwing an exception."""
+
+    class TestModel(BoringModel):
+        def training_step(self, batch, batch_idx):
+            if batch_idx == 1 and self.trainer.is_global_zero:
+                # rank 0: raises an exception
+                # rank 1: continues training but will hang on the next barrier in the training loop
+                raise CustomException
+            return super().training_step(batch, batch_idx)
+
+    model = TestModel()
+
+    trainer = Trainer(
+        default_root_dir=tmpdir,
+        max_epochs=1,
+        limit_train_batches=5,
+        num_sanity_val_steps=0,
+        accelerator="gpu",
+        devices=2,
+        strategy="ddp",
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+
+    # simulate random failure in training_step on rank 0
+    with pytest.raises(DeadlockDetectedException, match="CustomException"):
+        trainer.fit(model)
 
 
 @RunIf(min_cuda_gpus=1)
@@ -1778,7 +1922,7 @@ class ExceptionCounter(Callback):
         self.exceptions += 1
 
 
-@pytest.mark.parametrize("strategy", ["auto", pytest.param("ddp_spawn", marks=RunIf(skip_windows=True, mps=False))])
+@pytest.mark.parametrize("strategy", [None, pytest.param("ddp_spawn", marks=RunIf(skip_windows=True))])
 def test_error_handling_all_stages(tmpdir, strategy):
     model = TrainerStagesErrorsModel()
     counter = ExceptionCounter()
@@ -1873,18 +2017,18 @@ def test_detect_anomaly_nan(tmpdir):
 @pytest.mark.parametrize(
     ["trainer_kwargs", "strategy_cls", "strategy_name", "accelerator_cls", "devices"],
     [
-        ({"strategy": "auto"}, SingleDeviceStrategy, "single_device", CPUAccelerator, 1),
-        pytest.param({"strategy": "ddp"}, DDPStrategy, "ddp", CPUAccelerator, 1, marks=RunIf(mps=False)),
-        pytest.param(
-            {"strategy": "ddp", "num_nodes": 2}, DDPStrategy, "ddp", CPUAccelerator, 1, marks=RunIf(mps=False)
-        ),
+        ({"strategy": None}, SingleDeviceStrategy, "single_device", CPUAccelerator, 1),
+        ({"strategy": "dp"}, DDPStrategy, "ddp", CPUAccelerator, 1),
+        ({"strategy": "ddp"}, DDPStrategy, "ddp", CPUAccelerator, 1),
+        ({"strategy": "ddp", "num_nodes": 2}, DDPStrategy, "ddp", CPUAccelerator, 1),
         (
-            {"strategy": "auto", "accelerator": "cuda", "devices": 1},
+            {"strategy": None, "accelerator": "cuda", "devices": 1},
             SingleDeviceStrategy,
             "single_device",
             CUDAAccelerator,
             1,
         ),
+        ({"strategy": "dp", "accelerator": "cuda", "devices": 1}, DataParallelStrategy, "dp", CUDAAccelerator, 1),
         ({"strategy": "ddp", "accelerator": "cuda", "devices": 1}, DDPStrategy, "ddp", CUDAAccelerator, 1),
         (
             {"strategy": "ddp_spawn", "accelerator": "cuda", "devices": 1},
@@ -1893,7 +2037,8 @@ def test_detect_anomaly_nan(tmpdir):
             CUDAAccelerator,
             1,
         ),
-        ({"strategy": "auto", "accelerator": "cuda", "devices": 2}, DDPStrategy, "ddp", CUDAAccelerator, 2),
+        ({"strategy": None, "accelerator": "cuda", "devices": 2}, DDPSpawnStrategy, "ddp_spawn", CUDAAccelerator, 2),
+        ({"strategy": "dp", "accelerator": "cuda", "devices": 2}, DataParallelStrategy, "dp", CUDAAccelerator, 2),
         ({"strategy": "ddp", "accelerator": "cuda", "devices": 2}, DDPStrategy, "ddp", CUDAAccelerator, 2),
         ({"strategy": "ddp", "accelerator": "cpu", "devices": 2}, DDPStrategy, "ddp", CPUAccelerator, 2),
         (
@@ -1911,6 +2056,13 @@ def test_detect_anomaly_nan(tmpdir):
             1,
         ),
         (
+            {"strategy": "ddp_fully_sharded", "accelerator": "cuda", "devices": 1},
+            DDPFullyShardedStrategy,
+            "ddp_fully_sharded",
+            CUDAAccelerator,
+            1,
+        ),
+        (
             {"strategy": DDPSpawnStrategy(), "accelerator": "cpu", "devices": 2},
             DDPSpawnStrategy,
             "ddp_spawn",
@@ -1924,12 +2076,61 @@ def test_detect_anomaly_nan(tmpdir):
             CUDAAccelerator,
             2,
         ),
-        pytest.param({"strategy": DDPStrategy()}, DDPStrategy, "ddp", CPUAccelerator, 1, marks=RunIf(mps=False)),
+        ({"strategy": DDPStrategy()}, DDPStrategy, "ddp", CPUAccelerator, 1),
         ({"strategy": DDPStrategy(), "accelerator": "cuda", "devices": 2}, DDPStrategy, "ddp", CUDAAccelerator, 2),
+        (
+            {"strategy": DataParallelStrategy(), "accelerator": "cuda", "devices": 2},
+            DataParallelStrategy,
+            "dp",
+            CUDAAccelerator,
+            2,
+        ),
+        (
+            {"strategy": DDPFullyShardedStrategy(), "accelerator": "cuda", "devices": 2},
+            DDPFullyShardedStrategy,
+            "ddp_fully_sharded",
+            CUDAAccelerator,
+            2,
+        ),
+        (
+            {"strategy": DDPSpawnShardedStrategy(), "accelerator": "cuda", "devices": 2},
+            DDPSpawnShardedStrategy,
+            "ddp_sharded_spawn",
+            CUDAAccelerator,
+            2,
+        ),
+        (
+            {"strategy": DDPShardedStrategy(), "accelerator": "cuda", "devices": 2},
+            DDPShardedStrategy,
+            "ddp_sharded",
+            CUDAAccelerator,
+            2,
+        ),
         (
             {"strategy": "ddp_spawn", "accelerator": "cuda", "devices": 2, "num_nodes": 2},
             DDPSpawnStrategy,
             "ddp_spawn",
+            CUDAAccelerator,
+            2,
+        ),
+        (
+            {"strategy": "ddp_fully_sharded", "accelerator": "cuda", "devices": 1, "num_nodes": 2},
+            DDPFullyShardedStrategy,
+            "ddp_fully_sharded",
+            CUDAAccelerator,
+            1,
+        ),
+        (
+            {"strategy": "ddp_sharded", "accelerator": "cuda", "devices": 2, "num_nodes": 2},
+            DDPShardedStrategy,
+            "ddp_sharded",
+            CUDAAccelerator,
+            2,
+        ),
+        (
+            {"strategy": "ddp_sharded_spawn", "accelerator": "cuda", "devices": 2, "num_nodes": 2},
+            DDPSpawnShardedStrategy,
+            "ddp_sharded_spawn",
             CUDAAccelerator,
             2,
         ),
@@ -1962,35 +2163,18 @@ def test_trainer_config_strategy(monkeypatch, trainer_kwargs, strategy_cls, stra
 )
 def test_dataloaders_are_not_loaded_if_disabled_through_limit_batches(running_stage):
     dl_prefix = running_stage.dataloader_prefix
-    argument = f"limit_{dl_prefix}_batches"
-    trainer_kwargs = {argument: 0}
+    trainer_kwargs = {f"limit_{dl_prefix}_batches": 0}
     trainer = Trainer(**trainer_kwargs)
     model = BoringModel()
-    trainer.strategy.connect(model)
     trainer._data_connector.attach_data(model)
-
-    trainer.state.stage = running_stage
-    if running_stage == "train":
-        trainer.state.fn = "fit"
-        fn = trainer.fit_loop.setup_data
-    elif running_stage == "validate":
-        trainer.state.fn = "validate"
-        fn = trainer.validate_loop.setup_data
-    elif running_stage == "test":
-        trainer.state.fn = "test"
-        fn = trainer.test_loop.setup_data
-    else:
-        fn = trainer.predict_loop.setup_data
-
-    # with no limit, the attribute is None
-    fn()
-    dataloader_attribute = f"{dl_prefix}_dataloader{'' if running_stage == 'train' else 's'}"
-    assert getattr(trainer, dataloader_attribute) is None
-
-    # validate it would've worked if a limit was set
-    setattr(trainer, argument, 1)
-    fn()
-    assert isinstance(getattr(trainer, dataloader_attribute), DataLoader)
+    reset_dataloader = getattr(trainer, f"reset_{dl_prefix}_dataloader")
+    reset_dataloader(model)
+    dl = (
+        trainer.train_dataloader
+        if running_stage == RunningStage.TRAINING
+        else getattr(trainer, f"{dl_prefix}_dataloaders")
+    )
+    assert dl is None
 
 
 @pytest.mark.parametrize(
@@ -2020,8 +2204,8 @@ def test_trainer_config_device_ids(monkeypatch, trainer_kwargs, expected_device_
     elif trainer_kwargs.get("accelerator") in ("mps", "gpu"):
         mock_mps_count(monkeypatch, 1)
     elif trainer_kwargs.get("accelerator") == "ipu":
-        monkeypatch.setattr(lightning.pytorch.accelerators.ipu.IPUAccelerator, "is_available", lambda: True)
-        monkeypatch.setattr(lightning.pytorch.strategies.ipu, "_IPU_AVAILABLE", lambda: True)
+        monkeypatch.setattr(pytorch_lightning.accelerators.ipu.IPUAccelerator, "is_available", lambda: True)
+        monkeypatch.setattr(pytorch_lightning.strategies.ipu, "_IPU_AVAILABLE", lambda: True)
 
     trainer = Trainer(**trainer_kwargs)
     assert trainer.device_ids == expected_device_ids
@@ -2052,17 +2236,39 @@ def test_trainer_calls_logger_finalize_on_exception(tmpdir):
     logger.finalize.assert_called_once_with("failed")
 
 
-@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, RuntimeError])
-def test_trainer_calls_strategy_on_exception(exception_type):
-    """Test that when an exception occurs, the Trainer lets the strategy process it."""
-    exception = exception_type("Test exception")
+# TODO: replace with 1.14 when it is released
+@RunIf(min_torch="1.14.0.dev20221202")
+def test_trainer_compiled_model():
+    model = BoringModel()
 
-    class ExceptionModel(BoringModel):
-        def on_fit_start(self):
-            raise exception
+    model = torch.compile(model)
 
-    trainer = Trainer()
-    with mock.patch("lightning.pytorch.strategies.strategy.Strategy.on_exception") as on_exception_mock:
-        with suppress(Exception):
-            trainer.fit(ExceptionModel())
-    on_exception_mock.assert_called_once_with(exception)
+    data = BoringDataModule()
+
+    trainer = Trainer(
+        max_epochs=1,
+        limit_train_batches=1,
+        limit_val_batches=1,
+    )
+    trainer.fit(model, data)
+
+    assert trainer.model._compiler_ctx["compiler"] == "dynamo"
+
+    model = model.to_uncompiled()
+
+    assert model._compiler_ctx is None
+
+    trainer.fit(model)
+
+    assert trainer.model._compiler_ctx is None
+
+    model = torch.compile(model)
+
+    trainer = Trainer(max_epochs=1, limit_train_batches=1, limit_val_batches=1, strategy=DDPShardedStrategy)
+
+    with pytest.raises(RuntimeError, match="Using a compiled model is incompatible with the current strategy.*"):
+        trainer.fit(model)
+
+    trainer = Trainer(max_epochs=1, limit_train_batches=1, limit_val_batches=1, strategy=DDPStrategy)
+
+    trainer.fit(model)

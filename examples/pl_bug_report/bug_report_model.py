@@ -3,7 +3,7 @@ import os
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from lightning.pytorch import LightningModule, Trainer
+from pytorch_lightning import LightningModule, Trainer
 
 
 class RandomDataset(Dataset):

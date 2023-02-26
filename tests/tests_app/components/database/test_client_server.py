@@ -10,11 +10,11 @@ from uuid import uuid4
 
 import pytest
 
-from lightning.app import LightningApp, LightningFlow, LightningWork
-from lightning.app.components.database import Database, DatabaseClient
-from lightning.app.components.database.utilities import _GeneralModel, _pydantic_column_type
-from lightning.app.runners import MultiProcessRuntime
-from lightning.app.utilities.imports import _is_sqlmodel_available
+from lightning_app import LightningApp, LightningFlow, LightningWork
+from lightning_app.components.database import Database, DatabaseClient
+from lightning_app.components.database.utilities import _GeneralModel, _pydantic_column_type
+from lightning_app.runners import MultiProcessRuntime
+from lightning_app.utilities.imports import _is_sqlmodel_available
 
 if _is_sqlmodel_available():
     from sqlalchemy import Column
@@ -109,7 +109,7 @@ def test_client_server():
                 self._client.insert(TestConfig(name="name", secrets=secrets))
 
                 assert self._client.select_all(TestConfig)
-                self.stop()
+                self._exit()
 
     app = LightningApp(Flow())
     MultiProcessRuntime(app, start_server=False).dispatch()
@@ -143,11 +143,11 @@ def test_work_database_restart():
 
             if not self.restart:
                 self._client.insert(TestConfig(name="echo", secrets=[Secret(name="example", value="secret")]))
-                self.stop()
+                self._exit()
             else:
                 assert os.path.exists(self._db_filename)
                 assert len(self._client.select_all()) == 1
-                self.stop()
+                self._exit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         app = LightningApp(Flow(db_root=tmpdir))
@@ -196,7 +196,7 @@ def test_work_database_periodic_store():
             elif (time.time() - self._start_time) > 2:
                 assert os.path.exists(self._db_filename)
                 assert len(self._client.select_all()) == 1
-                self.stop()
+                self._exit()
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:

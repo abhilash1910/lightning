@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,18 +21,19 @@ from torch.nn import Module
 from torch.optim import Optimizer
 
 import lightning.pytorch as pl
-from lightning.fabric.plugins import Precision as FabricPrecision
+from lightning.fabric.plugins import Precision as LitePrecision
 from lightning.fabric.utilities.types import Steppable
 from lightning.pytorch.core.hooks import CheckpointHooks
-from lightning.pytorch.trainer import call
-from lightning.pytorch.utilities import GradClipAlgorithmType
+from lightning.pytorch.utilities import grad_norm, GradClipAlgorithmType
 
 
-class PrecisionPlugin(FabricPrecision, CheckpointHooks):
+class PrecisionPlugin(LitePrecision, CheckpointHooks):
     """Base class for all plugins handling the precision-specific parts of the training.
 
     The class attribute precision must be overwritten in child classes. The default value reflects fp32 training.
     """
+
+    precision: Union[str, int] = 32
 
     def connect(
         self, model: Module, optimizers: List[Optimizer], lr_schedulers: List[Any]
@@ -41,9 +42,8 @@ class PrecisionPlugin(FabricPrecision, CheckpointHooks):
         return model, optimizers, lr_schedulers
 
     def pre_backward(self, tensor: Tensor, module: "pl.LightningModule") -> Tensor:  # type: ignore[override]
-        trainer = module.trainer
-        call._call_callback_hooks(trainer, "on_before_backward", tensor)
-        call._call_lightning_module_hook(trainer, "on_before_backward", tensor)
+        module.trainer._call_callback_hooks("on_before_backward", tensor)
+        module.trainer._call_lightning_module_hook("on_before_backward", tensor)
         return tensor
 
     def backward(  # type: ignore[override]
@@ -51,6 +51,7 @@ class PrecisionPlugin(FabricPrecision, CheckpointHooks):
         tensor: Tensor,
         model: "pl.LightningModule",
         optimizer: Optional[Steppable],
+        optimizer_idx: Optional[int],
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -60,28 +61,32 @@ class PrecisionPlugin(FabricPrecision, CheckpointHooks):
             tensor: the loss value obtained from the closure
             model: the model to be optimized
             optimizer: current optimizer being used. ``None`` if using manual optimization
+            optimizer_idx: the index of the current optimizer. ``None`` if using manual optimization
             \*args: Positional arguments intended for the actual function that performs the backward, like
                 :meth:`~torch.Tensor.backward`.
             \**kwargs: Keyword arguments for the same purpose as ``*args``.
         """
-        model.backward(tensor, *args, **kwargs)
+        model.backward(tensor, optimizer, optimizer_idx, *args, **kwargs)
 
     def post_backward(self, tensor: Tensor, module: "pl.LightningModule") -> Tensor:  # type: ignore[override]
         # once backward has been applied, release graph
         closure_loss = tensor.detach()
-        trainer = module.trainer
-        call._call_callback_hooks(trainer, "on_after_backward")
-        call._call_lightning_module_hook(trainer, "on_after_backward")
+        module.trainer._call_callback_hooks("on_after_backward")
+        module.trainer._call_lightning_module_hook("on_after_backward")
         return closure_loss
 
-    def _after_closure(self, model: "pl.LightningModule", optimizer: Steppable) -> None:
+    def _after_closure(self, model: "pl.LightningModule", optimizer: Steppable, optimizer_idx: int) -> None:
         """Utility to share some code after the closure has been run."""
         trainer = model.trainer
-        call._call_callback_hooks(trainer, "on_before_optimizer_step", optimizer)
-        call._call_lightning_module_hook(trainer, "on_before_optimizer_step", optimizer)
+        trainer._call_callback_hooks("on_before_optimizer_step", optimizer, optimizer_idx)
+        trainer._call_lightning_module_hook("on_before_optimizer_step", optimizer, optimizer_idx)
+        # TODO: this is done for the entire model but should be changed to per-optimizer
+        if optimizer_idx == 0:
+            self._track_grad_norm(trainer)
         self._clip_gradients(
             model,
             optimizer,
+            optimizer_idx,
             trainer.gradient_clip_val,
             gradient_clip_algorithm=trainer.gradient_clip_algorithm,
         )
@@ -90,6 +95,7 @@ class PrecisionPlugin(FabricPrecision, CheckpointHooks):
         self,
         model: "pl.LightningModule",
         optimizer: Optimizer,
+        optimizer_idx: int,
         closure: Callable[[], Any],
     ) -> Any:
         """This double-closure allows makes sure the ``closure`` is executed before the
@@ -99,24 +105,41 @@ class PrecisionPlugin(FabricPrecision, CheckpointHooks):
         consistent with the ``PrecisionPlugin`` subclasses that cannot pass ``optimizer.step(closure)`` directly.
         """
         closure_result = closure()
-        self._after_closure(model, optimizer)
+        self._after_closure(model, optimizer, optimizer_idx)
         return closure_result
 
     def optimizer_step(  # type: ignore[override]
         self,
         optimizer: Steppable,
         model: "pl.LightningModule",
+        optimizer_idx: int,
         closure: Callable[[], Any],
         **kwargs: Any,
     ) -> Any:
         """Hook to run the optimizer step."""
-        closure = partial(self._wrap_closure, model, optimizer, closure)
+        closure = partial(self._wrap_closure, model, optimizer, optimizer_idx, closure)
         return optimizer.step(closure=closure, **kwargs)
+
+    def _track_grad_norm(self, trainer: "pl.Trainer") -> None:
+        if trainer.track_grad_norm == -1:
+            return
+
+        kwargs = {}
+        if len(trainer.loggers) == 1:
+            kwargs["group_separator"] = trainer.loggers[0].group_separator
+
+        grad_norm_dict = grad_norm(trainer.lightning_module, trainer.track_grad_norm, **kwargs)
+        if grad_norm_dict:
+            prev_fx = trainer.lightning_module._current_fx_name
+            trainer.lightning_module._current_fx_name = "on_before_optimizer_step"
+            trainer.lightning_module.log_grad_norm(grad_norm_dict)
+            trainer.lightning_module._current_fx_name = prev_fx
 
     def _clip_gradients(
         self,
         model: Union["pl.LightningModule", Module],
         optimizer: Steppable,
+        optimizer_idx: int,
         clip_val: Optional[Union[int, float]] = None,
         gradient_clip_algorithm: Optional[GradClipAlgorithmType] = None,
     ) -> None:
@@ -124,10 +147,10 @@ class PrecisionPlugin(FabricPrecision, CheckpointHooks):
             # the configuration validator disallows clipping on manual
             return
 
-        call._call_lightning_module_hook(
-            model.trainer,
+        model.trainer._call_lightning_module_hook(
             "configure_gradient_clipping",
             optimizer,
+            optimizer_idx,
             gradient_clip_val=clip_val,
             gradient_clip_algorithm=gradient_clip_algorithm,
         )
@@ -155,6 +178,9 @@ class PrecisionPlugin(FabricPrecision, CheckpointHooks):
         """Clip gradients by norm."""
         parameters = self.main_params(optimizer)
         torch.nn.utils.clip_grad_norm_(parameters, clip_val)
+
+    def dispatch(self, trainer: "pl.Trainer") -> None:
+        """Hook to do something when ``Strategy.dispatch()`` gets called."""
 
     @contextlib.contextmanager
     def train_step_context(self) -> Generator[None, None, None]:

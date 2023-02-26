@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ import os
 import fsspec
 from fsspec.implementations.local import LocalFileSystem
 
-from lightning.fabric.utilities.cloud_io import get_filesystem
+from lightning_fabric.utilities.cloud_io import get_filesystem
 
 
 def test_get_filesystem_custom_filesystem():

@@ -1,17 +1,3 @@
-# Copyright The Lightning AI team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import os
 import pathlib
 import queue
@@ -31,7 +17,6 @@ from typing import Any, Callable, Dict, Generator, Optional, Set, Tuple, Type, T
 from deepdiff import DeepDiff, Delta
 from lightning_utilities.core.apply_func import apply_to_collection
 
-from lightning.app.core import constants
 from lightning.app.core.queues import MultiProcessQueue
 from lightning.app.storage import Path
 from lightning.app.storage.copier import _Copier, _copy_files
@@ -256,7 +241,6 @@ class WorkStateObserver(Thread):
         interval: float = 1,
     ) -> None:
         super().__init__(daemon=True)
-        self.started = False
         self._work = work
         self._delta_queue = delta_queue
         self._flow_to_work_delta_queue = flow_to_work_delta_queue
@@ -267,7 +251,6 @@ class WorkStateObserver(Thread):
         self._last_state = deepcopy(self._work.state)
 
     def run(self) -> None:
-        self.started = True
         while not self._exit_event.is_set():
             time.sleep(self._interval)
             # Run the thread only if active
@@ -418,8 +401,7 @@ class WorkRunner:
                 self.run_once()
             except KeyboardInterrupt:
                 if self.state_observer:
-                    if self.state_observer.started:
-                        self.state_observer.join(0)
+                    self.state_observer.join(0)
                     self.state_observer = None
                 self.copier.join(0)
             except LightningSigtermStateException as e:
@@ -430,8 +412,7 @@ class WorkRunner:
                 self.error_queue.put(e)
                 # Terminate the threads
                 if self.state_observer:
-                    if self.state_observer.started:
-                        self.state_observer.join(0)
+                    self.state_observer.join(0)
                     self.state_observer = None
                 self.copier.join(0)
                 raise e
@@ -501,8 +482,7 @@ class WorkRunner:
         # Set the internal IP address.
         # Set this here after the state observer is initialized, since it needs to record it as a change and send
         # it back to the flow
-        default_internal_ip = "127.0.0.1" if constants.LIGHTNING_CLOUDSPACE_HOST is None else "0.0.0.0"
-        self.work._internal_ip = os.environ.get("LIGHTNING_NODE_IP", default_internal_ip)
+        self.work._internal_ip = os.environ.get("LIGHTNING_NODE_IP", "127.0.0.1")
 
         # 8. Patch the setattr method of the work. This needs to be done after step 4, so we don't
         # send delta while calling `set_state`.
@@ -574,8 +554,7 @@ class WorkRunner:
 
         # 13. Destroy the state observer.
         if self.run_executor_cls.enable_start_observer:
-            if self.state_observer.started:
-                self.state_observer.join(0)
+            self.state_observer.join(0)
         self.state_observer = None
 
         # 14. Copy all artifacts to the shared storage so other Works can access them while this Work gets scaled down
@@ -613,16 +592,14 @@ class WorkRunner:
             self.work._calls[call_hash]["statuses"].append(
                 make_status(WorkStageStatus.STOPPED, reason=WorkStopReasons.SIGTERM_SIGNAL_HANDLER)
             )
+            delta = Delta(DeepDiff(state, self.work.state, verbose_level=2))
+            self.delta_queue.put(ComponentDelta(id=self.work_name, delta=delta))
 
         # kill the thread as the job is going to be terminated.
-        if self.state_observer:
-            if self.state_observer.started:
-                self.state_observer.join(0)
-            self.state_observer = None
-        delta = Delta(DeepDiff(state, deepcopy(self.work.state), verbose_level=2))
-        self.delta_queue.put(ComponentDelta(id=self.work_name, delta=delta))
-
         self.copier.join(0)
+        if self.state_observer:
+            self.state_observer.join(0)
+            self.state_observer = None
         raise LightningSigtermStateException(0)
 
     def _proxy_setattr(self, cleanup: bool = False):

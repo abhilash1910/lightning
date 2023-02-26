@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -81,6 +81,9 @@ class ParallelStrategy(Strategy, ABC):
             num_replicas=len(self.parallel_devices) if self.parallel_devices is not None else 0,
             rank=self.global_rank,
         )
+
+    def reconciliate_processes(self, trace: str) -> None:
+        """Function to re-conciliate processes on failure."""
 
     def all_gather(self, tensor: Tensor, group: Optional[Any] = None, sync_grads: bool = False) -> Tensor:
         """Perform a all_gather on all processes."""

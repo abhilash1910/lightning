@@ -1,6 +1,6 @@
 import pandas  # noqa F401
 
-from lightning.app import LightningWork
+from lightning_app import LightningWork
 
 
 class A(LightningWork):

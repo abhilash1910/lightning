@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@ from unittest.mock import ANY, call, Mock
 import pytest
 from torch.utils.data import DataLoader
 
-from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import BasePredictionWriter
-from lightning.pytorch.demos.boring_classes import BoringModel, RandomDataset
-from lightning.pytorch.utilities.exceptions import MisconfigurationException
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import BasePredictionWriter
+from pytorch_lightning.demos.boring_classes import BoringModel, RandomDataset
+from pytorch_lightning.trainer.supporters import CombinedLoader
+from pytorch_lightning.utilities.exceptions import MisconfigurationException
+from tests_pytorch.helpers.runif import RunIf
 
 
 class DummyPredictionWriter(BasePredictionWriter):
@@ -80,7 +83,7 @@ def test_prediction_writer_hook_call_intervals():
     assert cb.write_on_epoch_end.call_count == 1
 
 
-@pytest.mark.parametrize("num_workers", [0, 2])
+@pytest.mark.parametrize("num_workers", [0, pytest.param(2, marks=RunIf(slow=True))])
 def test_prediction_writer_batch_indices(num_workers):
     DummyPredictionWriter.write_on_batch_end = Mock()
     DummyPredictionWriter.write_on_epoch_end = Mock()
@@ -105,6 +108,38 @@ def test_prediction_writer_batch_indices(num_workers):
             call(trainer, model, ANY, [[[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]]]),
         ]
     )
+
+
+def test_prediction_writer_partial_support_for_combined_loader():
+    """Test partial support for CombinedLoader: prediction works but sample indices don't get tracked."""
+    pl.loops.epoch.prediction_epoch_loop.warning_cache.clear()
+
+    class PredictionModel(BoringModel):
+        def predict_dataloader(self):
+            return CombinedLoader(
+                {
+                    "a": DataLoader(RandomDataset(32, 8), batch_size=2),
+                    "b": DataLoader(RandomDataset(32, 8), batch_size=4),
+                }
+            )
+
+        def predict_step(self, batch, *args, **kwargs):
+            return self(batch["a"])
+
+    DummyPredictionWriter.write_on_batch_end = Mock()
+    DummyPredictionWriter.write_on_epoch_end = Mock()
+
+    model = PredictionModel()
+    writer = DummyPredictionWriter("batch_and_epoch")
+    trainer = Trainer(callbacks=writer)
+    with pytest.warns(UserWarning, match="Lightning couldn't infer the indices fetched for your dataloader."):
+        trainer.predict(model)
+
+    writer.write_on_batch_end.assert_has_calls(
+        [call(trainer, model, ANY, [], ANY, 0, 0), call(trainer, model, ANY, [], ANY, 1, 0)]
+    )
+
+    writer.write_on_epoch_end.assert_has_calls([call(trainer, model, ANY, [[]])])
 
 
 def test_batch_level_batch_indices():

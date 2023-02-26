@@ -87,7 +87,7 @@ class Root(L.LightningFlow):
 
     def run(self):
         sleep(10)
-        self.stop("Layout End")
+        self._exit("Layout End")
 
     def configure_layout(self):
         return [

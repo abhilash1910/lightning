@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@ import os
 from typing import Any, Dict, Optional, Union
 from unittest.mock import Mock
 
-import lightning.pytorch as pl
-from lightning.pytorch import Callback, Trainer
-from lightning.pytorch.demos.boring_classes import BoringModel
-from lightning.pytorch.loggers.logger import Logger
+import pytorch_lightning as pl
+from pytorch_lightning import Callback, Trainer
+from pytorch_lightning.demos.boring_classes import BoringModel
+from pytorch_lightning.loggers.logger import Logger
 from tests_pytorch.helpers.runif import RunIf
 
 
@@ -84,6 +84,7 @@ def test_all_rank_logging_ddp_spawn(tmpdir):
     """Check that all ranks can be logged from."""
     model = TestModel()
     all_rank_logger = AllRankLogger()
+    model.training_epoch_end = None
     trainer = Trainer(
         strategy="ddp_spawn",
         accelerator="gpu",

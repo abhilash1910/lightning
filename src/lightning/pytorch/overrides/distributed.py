@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
-from typing import Any, cast, Dict, Iterable, Iterator, List, Optional, Sized, Union
+from typing import Any, cast, Iterable, Iterator, List, Optional, Sized, Union
 
 import torch
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import BatchSampler, DistributedSampler, Sampler
 
+import lightning.pytorch as pl
 from lightning.fabric.utilities.distributed import _DatasetSamplerWrapper
+from lightning.pytorch.overrides.base import _LightningModuleWrapperBase, _LightningPrecisionModuleWrapperBase
+
+
+class LightningDistributedModule(_LightningModuleWrapperBase):
+    def __init__(
+        self,
+        forward_module: Optional[Union["pl.LightningModule", _LightningPrecisionModuleWrapperBase]] = None,
+        pl_module: Optional[Union["pl.LightningModule", _LightningPrecisionModuleWrapperBase]] = None,
+    ) -> None:
+        self._validate_init_arguments(pl_module, forward_module)
+        super().__init__(forward_module=(pl_module or forward_module))
 
 
 def _find_tensors(
@@ -108,36 +120,30 @@ class UnrepeatedDistributedSamplerWrapper(UnrepeatedDistributedSampler):
         return (self.dataset[index] for index in super().__iter__())
 
 
-class _IndexBatchSamplerWrapper(BatchSampler):
+class IndexBatchSamplerWrapper:
     """This class is used to wrap a :class:`torch.utils.data.BatchSampler` and capture its indices."""
 
-    def __init__(self, batch_sampler: BatchSampler) -> None:
-        # do not call super().__init__() on purpose
+    def __init__(self, sampler: BatchSampler) -> None:
         self.seen_batch_indices: List[List[int]] = []
-
-        self.__dict__ = {
-            k: v
-            for k, v in batch_sampler.__dict__.items()
-            if k not in ("__next__", "__iter__", "__len__", "__getstate__")
-        }
-        self._batch_sampler = batch_sampler
-        self._iterator: Optional[Iterator[List[int]]] = None
-
-    def __next__(self) -> List[int]:
-        assert self._iterator is not None
-        batch = next(self._iterator)
-        self.seen_batch_indices.append(batch)
-        return batch
+        self._sampler = sampler
 
     def __iter__(self) -> Iterator[List[int]]:
         self.seen_batch_indices = []
-        self._iterator = iter(self._batch_sampler)
-        return self
+        for batch in self._sampler:
+            self.seen_batch_indices.append(batch)
+            yield batch
 
     def __len__(self) -> int:
-        return len(self._batch_sampler)
+        return len(self._sampler)
 
-    def __getstate__(self) -> Dict[str, Any]:
-        state = self.__dict__.copy()
-        state["_iterator"] = None  # cannot pickle 'generator' object
-        return state
+    @property
+    def drop_last(self) -> bool:
+        return self._sampler.drop_last
+
+    @property
+    def batch_size(self) -> int:
+        return self._sampler.batch_size
+
+    @property
+    def sampler(self) -> Union[Sampler, Iterable]:
+        return self._sampler.sampler

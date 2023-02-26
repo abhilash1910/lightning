@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 import os
 from unittest import mock
 
-from lightning.pytorch import Trainer
-from lightning.pytorch.demos.boring_classes import BoringModel
+from pytorch_lightning import Trainer
+from pytorch_lightning.demos.boring_classes import BoringModel
 
 
 def test_passing_no_env_variables():

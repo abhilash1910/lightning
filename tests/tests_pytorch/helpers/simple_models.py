@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 from torchmetrics import Accuracy, MeanSquaredError
 
-from lightning.pytorch import LightningModule
+from pytorch_lightning import LightningModule
 
 
 class ClassificationModel(LightningModule):

@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import lightning.pytorch as pl
-from lightning.pytorch import Callback, Trainer
-from lightning.pytorch.demos.boring_classes import BoringModel
-from lightning.pytorch.strategies import DeepSpeedStrategy
-from lightning.pytorch.utilities.model_summary import DeepSpeedSummary
+import pytorch_lightning as pl
+from pytorch_lightning import Callback, Trainer
+from pytorch_lightning.demos.boring_classes import BoringModel
+from pytorch_lightning.strategies import DeepSpeedStrategy
+from pytorch_lightning.utilities.model_summary import DeepSpeedSummary
 from tests_pytorch.helpers.runif import RunIf
 
 
@@ -45,7 +45,7 @@ def test_deepspeed_summary(tmpdir):
         accelerator="gpu",
         fast_dev_run=True,
         devices=2,
-        precision="16-mixed",
+        precision=16,
         enable_model_summary=True,
         callbacks=[TestCallback()],
     )

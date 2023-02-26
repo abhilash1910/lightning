@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,6 +16,7 @@ from lightning.fabric.accelerators.cuda import CUDAAccelerator, find_usable_cuda
 from lightning.fabric.accelerators.mps import MPSAccelerator  # noqa: F401
 from lightning.fabric.accelerators.registry import _AcceleratorRegistry, call_register_accelerators
 from lightning.fabric.accelerators.tpu import TPUAccelerator  # noqa: F401
+from lightning.fabric.accelerators.xpu import XPUAccelerator  # noqa: F401
 
 _ACCELERATORS_BASE_MODULE = "lightning.fabric.accelerators"
 ACCELERATOR_REGISTRY = _AcceleratorRegistry()

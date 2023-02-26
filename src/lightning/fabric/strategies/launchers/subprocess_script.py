@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,13 +19,13 @@ from typing import Any, Callable, Optional, Sequence, Tuple
 from lightning_utilities.core.imports import RequirementCache
 
 from lightning.fabric.plugins.environments.cluster_environment import ClusterEnvironment
-from lightning.fabric.strategies.launchers.launcher import _Launcher
+from lightning.fabric.strategies.launchers.base import _Launcher
 
 _HYDRA_AVAILABLE = RequirementCache("hydra-core")
 
 
 class _SubprocessScriptLauncher(_Launcher):
-    r"""A process launcher that invokes the current script as many times as desired in a single node.
+    r"""A process laucher that invokes the current script as many times as desired in a single node.
 
     This launcher needs to be invoked on each node.
     In its default behavior, the main process in each node then spawns N-1 child processes via :func:`subprocess.Popen`,

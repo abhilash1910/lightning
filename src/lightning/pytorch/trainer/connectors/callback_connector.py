@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import lightning.pytorch as pl
 from lightning.pytorch.callbacks import (
     Callback,
     Checkpoint,
+    GradientAccumulationScheduler,
     ModelCheckpoint,
     ModelSummary,
     ProgressBarBase,
@@ -31,7 +32,6 @@ from lightning.pytorch.callbacks.batch_size_finder import BatchSizeFinder
 from lightning.pytorch.callbacks.lr_finder import LearningRateFinder
 from lightning.pytorch.callbacks.rich_model_summary import RichModelSummary
 from lightning.pytorch.callbacks.timer import Timer
-from lightning.pytorch.trainer import call
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.imports import _PYTHON_GREATER_EQUAL_3_8_0, _PYTHON_GREATER_EQUAL_3_10_0
 from lightning.pytorch.utilities.model_helpers import is_overridden
@@ -52,6 +52,7 @@ class CallbackConnector:
         default_root_dir: Optional[str],
         enable_model_summary: bool,
         max_time: Optional[Union[str, timedelta, Dict[str, int]]] = None,
+        accumulate_grad_batches: Optional[Union[int, Dict[int, int]]] = None,
     ) -> None:
         # init folder paths for checkpoint + weights save callbacks
         self.trainer._default_root_dir = default_root_dir or os.getcwd()
@@ -75,12 +76,51 @@ class CallbackConnector:
         # configure the ModelSummary callback
         self._configure_model_summary_callback(enable_model_summary)
 
+        # accumulated grads
+        self._configure_accumulated_gradients(accumulate_grad_batches)
+
+        if self.trainer.state._fault_tolerant_mode.is_enabled:
+            self._configure_fault_tolerance_callbacks()
+
         self.trainer.callbacks.extend(_configure_external_callbacks())
         _validate_callbacks_list(self.trainer.callbacks)
 
         # push all model checkpoint callbacks to the end
         # it is important that these are the last callbacks to run
         self.trainer.callbacks = self._reorder_callbacks(self.trainer.callbacks)
+
+    def _configure_accumulated_gradients(
+        self, accumulate_grad_batches: Optional[Union[int, Dict[int, int]]] = None
+    ) -> None:
+        grad_accum_callbacks: List[GradientAccumulationScheduler] = [
+            cb for cb in self.trainer.callbacks if isinstance(cb, GradientAccumulationScheduler)
+        ]
+
+        if grad_accum_callbacks:
+            if accumulate_grad_batches is not None:
+                raise MisconfigurationException(
+                    "You have set both `accumulate_grad_batches` and passed an instance of "
+                    "`GradientAccumulationScheduler` inside callbacks. Either remove `accumulate_grad_batches` "
+                    "from trainer or remove `GradientAccumulationScheduler` from callbacks list."
+                )
+            grad_accum_callback = grad_accum_callbacks[0]
+        else:
+            if accumulate_grad_batches is None:
+                accumulate_grad_batches = 1
+
+            if isinstance(accumulate_grad_batches, dict):
+                grad_accum_callback = GradientAccumulationScheduler(accumulate_grad_batches)
+            elif isinstance(accumulate_grad_batches, int):
+                grad_accum_callback = GradientAccumulationScheduler({0: accumulate_grad_batches})
+            else:
+                raise MisconfigurationException(
+                    f"`accumulate_grad_batches` should be an int or a dict. Got {accumulate_grad_batches}."
+                )
+
+            self.trainer.callbacks.append(grad_accum_callback)
+
+        self.trainer.accumulate_grad_batches = grad_accum_callback.get_accumulate_grad_batches(0)
+        self.trainer.accumulation_scheduler = grad_accum_callback
 
     def _configure_checkpoint_callbacks(self, enable_checkpointing: bool) -> None:
         if self.trainer.checkpoint_callbacks:
@@ -148,6 +188,14 @@ class CallbackConnector:
         timer = Timer(duration=max_time, interval="step")
         self.trainer.callbacks.append(timer)
 
+    def _configure_fault_tolerance_callbacks(self) -> None:
+        from lightning.pytorch.callbacks.fault_tolerance import _FaultToleranceCheckpoint
+
+        if any(isinstance(cb, _FaultToleranceCheckpoint) for cb in self.trainer.callbacks):
+            raise RuntimeError("There should be only one fault-tolerance checkpoint callback.")
+        # don't use `log_dir` to minimize the chances of failure
+        self.trainer.callbacks.append(_FaultToleranceCheckpoint(dirpath=self.trainer.default_root_dir))
+
     def _attach_model_logging_functions(self) -> None:
         lightning_module = self.trainer.lightning_module
         for callback in self.trainer.callbacks:
@@ -162,15 +210,13 @@ class CallbackConnector:
         In addition, all :class:`~lightning.pytorch.callbacks.model_checkpoint.ModelCheckpoint` callbacks
         will be pushed to the end of the list, ensuring they run last.
         """
-        trainer = self.trainer
-
-        model_callbacks = call._call_lightning_module_hook(trainer, "configure_callbacks")
+        model_callbacks = self.trainer._call_lightning_module_hook("configure_callbacks")
         if not model_callbacks:
             return
 
         model_callbacks = [model_callbacks] if not isinstance(model_callbacks, Sequence) else model_callbacks
         model_callback_types = {type(c) for c in model_callbacks}
-        trainer_callback_types = {type(c) for c in trainer.callbacks}
+        trainer_callback_types = {type(c) for c in self.trainer.callbacks}
         override_types = model_callback_types.intersection(trainer_callback_types)
         if override_types:
             rank_zero_info(
@@ -179,11 +225,11 @@ class CallbackConnector:
                 f" {', '.join(sorted(t.__name__ for t in override_types))}"
             )
         # remove all callbacks with a type that occurs in model callbacks
-        all_callbacks = [c for c in trainer.callbacks if type(c) not in override_types]
+        all_callbacks = [c for c in self.trainer.callbacks if type(c) not in override_types]
         all_callbacks.extend(model_callbacks)
         all_callbacks = CallbackConnector._reorder_callbacks(all_callbacks)
         # TODO: connectors refactor: move callbacks list to connector and do not write Trainer state
-        trainer.callbacks = all_callbacks
+        self.trainer.callbacks = all_callbacks
 
     @staticmethod
     def _reorder_callbacks(callbacks: List[Callback]) -> List[Callback]:

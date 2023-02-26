@@ -1,17 +1,26 @@
 """Root package info."""
 
 import logging
-import os
+from typing import Any
 
-from lightning_utilities import module_available
+from lightning.pytorch import __about__
+from lightning.pytorch.__about__ import *  # noqa: F401, F403
 
-if os.path.isfile(os.path.join(os.path.dirname(__file__), "__about__.py")):
-    from lightning.pytorch.__about__ import *  # noqa: F401, F403
-if "__version__" not in locals():
-    if os.path.isfile(os.path.join(os.path.dirname(__file__), "__version__.py")):
-        from lightning.pytorch.__version__ import version as __version__
-    elif module_available("lightning"):
-        from lightning import __version__  # noqa: F401
+if not hasattr(__about__, "__version__"):
+    from lightning.pytorch.__version__ import version as __version__  # noqa: F401
+
+_DETAIL = 15  # between logging.INFO and logging.DEBUG, used for logging in production use cases
+
+
+def _detail(self: Any, message: str, *args: Any, **kwargs: Any) -> None:
+    if self.isEnabledFor(_DETAIL):
+        # logger takes its '*args' as 'args'
+        self._log(_DETAIL, message, args, **kwargs)
+
+
+logging.addLevelName(_DETAIL, "DETAIL")
+logging.detail = _detail
+logging.Logger.detail = _detail
 
 _root_logger = logging.getLogger()
 _logger = logging.getLogger(__name__)
@@ -26,7 +35,7 @@ from lightning.fabric.utilities.seed import seed_everything  # noqa: E402
 from lightning.pytorch.callbacks import Callback  # noqa: E402
 from lightning.pytorch.core import LightningDataModule, LightningModule  # noqa: E402
 from lightning.pytorch.trainer import Trainer  # noqa: E402
-
+#from lightning.pytorch.accelerators.xpu import XPUAccelerator
 # this import needs to go last as it will patch other modules
 import lightning.pytorch._graveyard  # noqa: E402, F401  # isort: skip
 

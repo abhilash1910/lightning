@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ Model Checkpointing
 ===================
 
 Automatically save model checkpoints during training.
+
 """
 import logging
 import os
@@ -79,8 +80,7 @@ class ModelCheckpoint(Checkpoint):
                 ...     filename='{epoch}-{val_loss:.2f}-{other_metric:.2f}'
                 ... )
 
-            By default, filename is ``None`` and will be set to ``'{epoch}-{step}'``, where "epoch" and "step" match
-            the number of finished epoch and optimizer steps respectively.
+            By default, filename is ``None`` and will be set to ``'{epoch}-{step}'``.
         monitor: quantity to monitor. By default it is ``None`` which saves a checkpoint only for the last epoch.
         verbose: verbosity mode. Default: ``False``.
         save_last: When ``True``, saves an exact copy of the checkpoint to a file `last.ckpt` whenever a checkpoint

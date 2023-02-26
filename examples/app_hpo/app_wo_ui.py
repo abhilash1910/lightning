@@ -20,7 +20,7 @@ class RootHPOFlow(L.LightningFlow):
 
     def run(self):
         if self.num_trials >= self.total_trials:
-            self.stop()
+            self._exit()
 
         has_told_study = []
 

@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,13 +23,14 @@ from typing import Any, Dict, Generator, List, Mapping, Optional, Tuple, TYPE_CH
 
 import torch
 from lightning_utilities.core.apply_func import apply_to_collection
+from lightning_utilities.core.imports import RequirementCache
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
 
 import lightning.pytorch as pl
 from lightning.fabric.plugins import ClusterEnvironment
-from lightning.fabric.strategies.deepspeed import _DEEPSPEED_AVAILABLE
+from lightning.fabric.utilities.enums import PrecisionType
 from lightning.fabric.utilities.optimizer import _optimizers_to_device
 from lightning.fabric.utilities.seed import reset_seed
 from lightning.fabric.utilities.types import _PATH, LRScheduler, ReduceLROnPlateau
@@ -49,6 +50,7 @@ from lightning.pytorch.utilities.types import LRSchedulerConfig, STEP_OUTPUT
 log = logging.getLogger(__name__)
 warning_cache = WarningCache()
 
+_DEEPSPEED_AVAILABLE = RequirementCache("deepspeed")
 if TYPE_CHECKING and _DEEPSPEED_AVAILABLE:
     import deepspeed
 
@@ -127,8 +129,8 @@ class DeepSpeedStrategy(DDPStrategy):
 
         Arguments:
 
-            zero_optimization: Enable ZeRO optimization. This is compatible with either `precision="16-mixed"` or
-                `precision="bf16-mixed"`.
+            zero_optimization: Enable ZeRO optimization. This is compatible with either `precision=16` or
+                `precision="bf16"`.
 
             stage: Different stages of the ZeRO Optimizer. 0 is disabled,
                 1 is optimizer state partitioning, 2 is optimizer+gradient state partitioning,
@@ -441,6 +443,13 @@ class DeepSpeedStrategy(DDPStrategy):
                 f"DeepSpeed strategy is only supported on GPU but `{self.accelerator.__class__.__name__}` is used."
             )
 
+        accumulation_scheduler = self.lightning_module.trainer.accumulation_scheduler
+
+        if accumulation_scheduler.epochs != [0]:
+            raise MisconfigurationException(
+                "DeepSpeed currently does not support different `accumulate_grad_batches` at different epochs."
+            )
+
         assert isinstance(self.model, (pl.LightningModule, _LightningPrecisionModuleWrapperBase))
         model = _LightningModuleWrapperBase(forward_module=self.model)
 
@@ -449,14 +458,18 @@ class DeepSpeedStrategy(DDPStrategy):
         else:
             self._initialize_deepspeed_inference(model)
 
-    def _init_optimizers(self) -> Tuple[Optimizer, Optional[LRSchedulerConfig]]:
+    def _init_optimizers(self) -> Tuple[Optimizer, Optional[LRSchedulerConfig], Optional[int]]:
         assert self.lightning_module is not None
-        optimizers, lr_schedulers = _init_optimizers_and_lr_schedulers(self.lightning_module)
+        optimizers, lr_schedulers, optimizer_frequencies = _init_optimizers_and_lr_schedulers(self.lightning_module)
         if len(optimizers) > 1 or len(lr_schedulers) > 1:
             raise MisconfigurationException(
                 "DeepSpeed currently only supports single optimizer, single optional scheduler."
             )
-        return optimizers[0], lr_schedulers[0] if lr_schedulers else None
+        return (
+            optimizers[0],
+            lr_schedulers[0] if lr_schedulers else None,
+            optimizer_frequencies[0] if optimizer_frequencies else None,
+        )
 
     @property
     def zero_stage_3(self) -> bool:
@@ -474,10 +487,7 @@ class DeepSpeedStrategy(DDPStrategy):
             )
             lr_scheduler = None
         else:
-            (
-                optimizer,
-                lr_scheduler,
-            ) = self._init_optimizers()
+            optimizer, lr_scheduler, _ = self._init_optimizers()
             if lr_scheduler is not None:
                 scheduler = lr_scheduler.scheduler
 
@@ -492,7 +502,7 @@ class DeepSpeedStrategy(DDPStrategy):
             # disable deepspeed lr scheduling as lightning manages scheduling
             model.lr_scheduler = None
             if lr_scheduler is None:
-                lr_scheduler = LRSchedulerConfig(deepspeed_scheduler, interval="step")
+                lr_scheduler = LRSchedulerConfig(deepspeed_scheduler, interval="step", opt_idx=0)
             else:
                 lr_scheduler.scheduler = deepspeed_scheduler
             self.lr_scheduler_configs = [lr_scheduler]
@@ -505,9 +515,9 @@ class DeepSpeedStrategy(DDPStrategy):
         if self.zero_stage_3:
             assert self._config_initialized
 
-            if self.precision_plugin.precision == "16-mixed":
+            if self.precision_plugin.precision == PrecisionType.HALF:
                 dtype = torch.float16
-            elif self.precision_plugin.precision == "bf16-mixed":
+            elif self.precision_plugin.precision == PrecisionType.BFLOAT:
                 dtype = torch.bfloat16
             else:
                 dtype = torch.float32
@@ -579,9 +589,10 @@ class DeepSpeedStrategy(DDPStrategy):
         # Skip initializing optimizers here as DeepSpeed handles optimizers via config.
         # User may have specified config options instead in configure_optimizers, but this is handled
         # via `_initialize_deepspeed_train`
-        # empty optimizers, schedulers
+        # empty optimizers, schedulers and frequencies
         self.optimizers = []
         self.lr_scheduler_configs = []
+        self.optimizer_frequencies = []
 
     @property
     def handles_gradient_accumulation(self) -> bool:
@@ -598,7 +609,7 @@ class DeepSpeedStrategy(DDPStrategy):
         self._format_precision_config()
 
     def _format_batch_size_and_grad_accum_config(self) -> None:
-        # TODO: Using Fabric, we do not support these variables within the config
+        # todo: using lite, we do not support these variables within the config
         assert isinstance(self.config, dict)
         if self.lightning_module is None:
             return
@@ -622,10 +633,10 @@ class DeepSpeedStrategy(DDPStrategy):
         # by default we try to use the batch size of the loader
         assert self.lightning_module is not None
         batch_size = 1
-        data_source = self.lightning_module.trainer.fit_loop._data_source
-        if data_source.is_defined():
+        train_dl_source = self.lightning_module.trainer._data_connector._train_dataloader_source
+        if train_dl_source.is_defined():
             try:
-                train_dataloader = data_source.dataloader()
+                train_dataloader = train_dl_source.dataloader()
                 if hasattr(train_dataloader, "batch_sampler"):
                     batch_size = train_dataloader.batch_sampler.batch_size  # type: ignore[union-attr]
             # broad exception on purpose as `source.dataloader()` will fail if the dataloader requires `setup`
@@ -641,8 +652,8 @@ class DeepSpeedStrategy(DDPStrategy):
 
     def _format_precision_config(self) -> None:
         assert isinstance(self.config, dict)
-        if self.precision_plugin.precision == "16-mixed":
-            if "fp16" not in self.config:
+        if self.precision_plugin.precision == PrecisionType.HALF:
+            if "fp16" not in self.config and self.precision_plugin.amp_type == "native":
                 # FP16 is a DeepSpeed standalone AMP implementation
                 rank_zero_info("Enabling DeepSpeed FP16.")
                 self.config["fp16"] = {
@@ -653,7 +664,10 @@ class DeepSpeedStrategy(DDPStrategy):
                     "hysteresis": self.hysteresis,
                     "min_loss_scale": self.min_loss_scale,
                 }
-        elif "bf16" not in self.config and self.precision_plugin.precision == "bf16-mixed":
+            elif "amp" not in self.config and self.precision_plugin.amp_type == "apex":
+                rank_zero_info("Enabling DeepSpeed APEX Implementation.")
+                self.config["amp"] = {"enabled": True, "opt_level": self.precision_plugin.amp_level}
+        elif "bf16" not in self.config and self.precision_plugin.precision == PrecisionType.BFLOAT:
             rank_zero_info("Enabling DeepSpeed BF16.")
             self.config["bf16"] = {"enabled": True}
 

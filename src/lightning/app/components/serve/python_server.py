@@ -1,19 +1,4 @@
-# Copyright The Lightning AI team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import abc
-import asyncio
 import base64
 import os
 import platform
@@ -267,19 +252,19 @@ class PythonServer(LightningWork, abc.ABC):
         return out
 
     def _attach_predict_fn(self, fastapi_app: FastAPI) -> None:
+        from torch import inference_mode, no_grad
+
         input_type: type = self.configure_input_type()
         output_type: type = self.configure_output_type()
 
-        def predict_fn_sync(request: input_type):  # type: ignore
-            return self.predict(request)
+        device = _get_device()
+        context = no_grad if device.type == "mps" else inference_mode
 
-        async def async_predict_fn(request: input_type):  # type: ignore
-            return await self.predict(request)
+        def predict_fn(request: input_type):  # type: ignore
+            with context():
+                return self.predict(request)
 
-        if asyncio.iscoroutinefunction(self.predict):
-            fastapi_app.post("/predict", response_model=output_type)(async_predict_fn)
-        else:
-            fastapi_app.post("/predict", response_model=output_type)(predict_fn_sync)
+        fastapi_app.post("/predict", response_model=output_type)(predict_fn)
 
     def get_code_sample(self, url: str) -> Optional[str]:
         input_type: Any = self.configure_input_type()
@@ -293,9 +278,7 @@ class PythonServer(LightningWork, abc.ABC):
         try:
             from lightning_api_access import APIAccessFrontend
         except ModuleNotFoundError:
-            logger.warn(
-                "Some dependencies to run the UI are missing. To resolve, run `pip install lightning-api-access`"
-            )
+            logger.warn("APIAccessFrontend not found. Please install lightning-api-access to enable the UI")
             return
 
         class_name = self.__class__.__name__

@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,12 @@
 from abc import ABC
 from typing import Any, Dict
 
+import torch
+
 import lightning.pytorch as pl
 from lightning.fabric.accelerators.accelerator import Accelerator as _Accelerator
 from lightning.fabric.utilities.types import _DEVICE
+from lightning.pytorch.utilities.rank_zero import rank_zero_deprecation
 
 
 class Accelerator(_Accelerator, ABC):
@@ -24,6 +27,17 @@ class Accelerator(_Accelerator, ABC):
 
     An Accelerator is meant to deal with one type of hardware.
     """
+
+    def setup_environment(self, root_device: torch.device) -> None:
+        """
+        .. deprecated:: v1.8.0
+            This hook was deprecated in v1.8.0 and will be removed in v1.10.0. Please use ``setup_device()`` instead.
+        """
+        rank_zero_deprecation(
+            "`Accelerator.setup_environment` has been deprecated in deprecated in v1.8.0 and will be removed in"
+            " v1.10.0. Please use ``setup_device()`` instead."
+        )
+        self.setup_device(root_device)
 
     def setup(self, trainer: "pl.Trainer") -> None:
         """Setup plugins for the trainer fit and creates optimizers.

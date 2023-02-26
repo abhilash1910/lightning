@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,24 +11,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections import OrderedDict
 from contextlib import contextmanager
-from typing import Any, Callable, Generator, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Generator, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
-import torch.distributed as dist
 from torch import Tensor
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader
 
 import lightning.pytorch as pl
 from lightning.fabric.utilities.warnings import PossibleUserWarning
-from lightning.pytorch.accelerators import TPUAccelerator
 from lightning.pytorch.callbacks.timer import Timer
-from lightning.pytorch.loops import _Loop
-from lightning.pytorch.loops.fetchers import _DataFetcher, _DataLoaderIterDataFetcher, _PrefetchDataFetcher
-from lightning.pytorch.loops.progress import BaseProgress
+from lightning.pytorch.loops import Loop
 from lightning.pytorch.strategies.parallel import ParallelStrategy
 from lightning.pytorch.strategies.strategy import Strategy
+from lightning.pytorch.trainer.progress import BaseProgress
+from lightning.pytorch.trainer.supporters import CombinedLoader
+from lightning.pytorch.utilities.exceptions import MisconfigurationException
+from lightning.pytorch.utilities.memory import recursive_detach
 from lightning.pytorch.utilities.rank_zero import rank_zero_warn
 from lightning.pytorch.utilities.signature_utils import is_param_in_hook_signature
+from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 
 def check_finite_loss(loss: Optional[Tensor]) -> None:
@@ -39,6 +45,28 @@ def check_finite_loss(loss: Optional[Tensor]) -> None:
     """
     if loss is not None and not torch.isfinite(loss).all():
         raise ValueError(f"The loss returned in `training_step` is {loss}.")
+
+
+def _extract_hiddens(training_step_output: STEP_OUTPUT, truncated_bptt_steps: int) -> Optional[Any]:
+    """Get the hidden state if present from the training step output.
+
+    Raises:
+        MisconfigurationException: If :attr:`~lightning.pytorch.core.Lightning.LightningModule.truncated_bptt_steps` is
+            not enabled and hiddens are returned or vice versa.
+    """
+    if not truncated_bptt_steps:
+        if isinstance(training_step_output, dict) and "hiddens" in training_step_output:
+            raise MisconfigurationException(
+                'You returned "hiddens" in your `training_step` but `truncated_bptt_steps` is disabled'
+            )
+        return None
+    if not isinstance(training_step_output, dict) or "hiddens" not in training_step_output:
+        raise MisconfigurationException(
+            'You enabled `truncated_bptt_steps` but did not `return {..., "hiddens": ...}` in your `training_step`'
+        )
+    # detach hiddens to avoid `RuntimeError: Trying to backward through the graph a second time`
+    hiddens = recursive_detach(training_step_output["hiddens"])
+    return hiddens
 
 
 def _parse_loop_limits(
@@ -83,6 +111,49 @@ def _parse_loop_limits(
     return min_epochs, max_epochs
 
 
+def _build_training_step_kwargs(
+    kwargs: OrderedDict,
+    lightning_module: "pl.LightningModule",
+    optimizers: Sequence[Optimizer],
+    opt_idx: Optional[int],
+    hiddens: Optional[Any],
+) -> OrderedDict:
+    """Builds the keyword arguments for training_step.
+
+    Args:
+        kwargs: The kwargs passed down to the hooks.
+        lightning_module: the LightningModule with a `training_step` hook implementation
+        optimizers: the list of optimizers from the Trainer
+        opt_idx: the index of the current optimizer
+        hiddens: the hidden state of the previous RNN iteration
+
+    Returns:
+        the keyword arguments for the training step
+    """
+    training_step_fx = getattr(lightning_module, "training_step")
+    if len(optimizers) > 1:
+        has_opt_idx_in_train_step = is_param_in_hook_signature(training_step_fx, "optimizer_idx")
+        if has_opt_idx_in_train_step:
+            if not lightning_module.automatic_optimization:
+                raise ValueError(
+                    "Your `LightningModule.training_step` signature contains an `optimizer_idx` argument but"
+                    " in manual optimization optimizers must be handled by the user. Remove the optimizer_idx"
+                    " argument or set `self.automatic_optimization = True`."
+                )
+            kwargs["optimizer_idx"] = opt_idx
+        elif not has_opt_idx_in_train_step and lightning_module.automatic_optimization:
+            raise ValueError(
+                f"Your LightningModule defines {len(optimizers)} optimizers but"
+                " `training_step` is missing the `optimizer_idx` argument."
+            )
+
+    # pass hiddens if using tbptt
+    if lightning_module.truncated_bptt_steps > 0:
+        kwargs["hiddens"] = hiddens
+
+    return kwargs
+
+
 @contextmanager
 def _block_parallel_sync_behavior(strategy: Strategy, block: bool = True) -> Generator[None, None, None]:
     """Blocks synchronization in :class:`~lightning.pytorch.strategies.parallel.ParallelStrategy`. This is useful
@@ -102,6 +173,33 @@ def _block_parallel_sync_behavior(strategy: Strategy, block: bool = True) -> Gen
         yield None
 
 
+@lru_cache(1)
+def _cumulative_optimizer_frequencies(frequencies: Tuple[int]) -> np.ndarray:
+    return np.cumsum(frequencies)
+
+
+def _get_active_optimizers(
+    optimizers: List[Optimizer], frequencies: List[int], batch_idx: int
+) -> List[Tuple[int, Optimizer]]:
+    """Returns the currently active optimizers. When multiple optimizers are used with different frequencies, only
+    one of the optimizers is active at a time.
+
+    Returns:
+        A list of tuples (opt_idx, optimizer) of currently active optimizers.
+    """
+    if not frequencies:
+        # call training_step once per optimizer
+        return list(enumerate(optimizers))
+
+    freq_cumsum = _cumulative_optimizer_frequencies(tuple(frequencies))
+    optimizers_loop_length = freq_cumsum[-1]
+    current_place_in_loop = batch_idx % optimizers_loop_length
+
+    # find optimizer index by looking for the first {item > current_place} in the cumsum list
+    opt_idx = np.searchsorted(freq_cumsum, current_place_in_loop, side="right")
+    return [(opt_idx, optimizers[opt_idx])]
+
+
 def _is_max_limit_reached(current: int, maximum: int = -1) -> bool:
     """Check if the limit has been reached (if enabled).
 
@@ -115,53 +213,23 @@ def _is_max_limit_reached(current: int, maximum: int = -1) -> bool:
     return maximum != -1 and current >= maximum
 
 
-def _reset_progress(loop: _Loop) -> None:
+def _reset_progress(loop: Loop) -> None:
     for v in vars(loop).values():
         if isinstance(v, BaseProgress):
             v.reset()
-        elif isinstance(v, _Loop):
+        elif isinstance(v, Loop):
             _reset_progress(v)
 
 
-def _select_data_fetcher(trainer: "pl.Trainer") -> _DataFetcher:
-    lightning_module = trainer.lightning_module
-    if trainer.testing:
-        step_fx_name = "test_step"
-    elif trainer.training:
-        step_fx_name = "training_step"
-    elif trainer.validating or trainer.sanity_checking:
-        step_fx_name = "validation_step"
-    elif trainer.predicting:
-        step_fx_name = "predict_step"
-    else:
-        raise RuntimeError(f"DataFetcher is unsupported for {trainer.state.stage}")
-    step_fx = getattr(lightning_module, step_fx_name)
-    if is_param_in_hook_signature(step_fx, "dataloader_iter", explicit=True):
-        rank_zero_warn(
-            f"Found `dataloader_iter` argument in the `{step_fx_name}`. Note that the support for "
-            "this signature is experimental and the behavior is subject to change."
-        )
-        return _DataLoaderIterDataFetcher()
-    return _PrefetchDataFetcher()
+def _set_sampler_epoch(dataloader: Union[DataLoader, CombinedLoader], epoch: int) -> None:
+    """Calls the ``set_epoch`` method on either the sampler or the batch sampler of the given dataloader.
 
+    Every PyTorch dataloader has either a sampler or a batch sampler, and if it is wrapped by a
+    :class:`~torch.utils.data.distributed.DistributedSampler`, ``set_epoch`` must be called at the beginning
+    of every epoch to ensure shuffling applies a new ordering. This has no effect if shuffling is off.
+    """
 
-def _no_grad_context(loop_run: Callable) -> Callable:
-    def _decorator(self: _Loop, *args: Any, **kwargs: Any) -> Any:
-        if not isinstance(self, _Loop):
-            raise TypeError(f"`{type(self).__name__}` needs to be a Loop.")
-        if not hasattr(self, "inference_mode"):
-            raise TypeError(f"`{type(self).__name__}.inference_mode` needs to be defined")
-        context_manager = (
-            torch.inference_mode
-            if (
-                self.inference_mode
-                # inference mode is not supported with gloo backend (#9431) and TPU accelerators.
-                and not (dist.is_available() and dist.is_initialized() and dist.get_backend() == "gloo")
-                and not isinstance(self.trainer.accelerator, TPUAccelerator)
-            )
-            else torch.no_grad
-        )
-        with context_manager():
-            return loop_run(self, *args, **kwargs)
-
-    return _decorator
+    for sampler_name in ("sampler", "batch_sampler"):
+        sampler = getattr(dataloader, sampler_name, None)
+        if sampler is not None and callable(getattr(sampler, "set_epoch", None)):
+            sampler.set_epoch(epoch)

@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,10 +40,20 @@ class LightningOptimizer:
         # copy most of the `Optimizer` methods into this instance. `__del__` is skipped in case the optimizer has
         # implemented custom logic which we would not want to call on destruction of the `LightningOptimizer`
         self.__dict__ = {k: v for k, v in optimizer.__dict__.items() if k not in ("step", "__del__")}
-        self.__class__ = type("Lightning" + optimizer.__class__.__name__, (self.__class__, optimizer.__class__), {})
+
+        # For Horovod
+        if hasattr(optimizer, "skip_synchronize"):
+            self.__class__ = type(
+                "Lightning" + optimizer.__class__.__name__, (self.__class__, optimizer.__class__.__bases__[0]), {}
+            )
+            self.skip_synchronize = optimizer.skip_synchronize
+            self.synchronize = optimizer.synchronize
+        else:
+            self.__class__ = type("Lightning" + optimizer.__class__.__name__, (self.__class__, optimizer.__class__), {})
 
         self._optimizer = optimizer
         self._strategy: Optional[pl.strategies.Strategy] = None
+        self._optimizer_idx = 0
         # to inject logic around the optimizer step, particularly useful with manual optimization
         self._on_before_step = do_nothing_closure
         self._on_after_step = do_nothing_closure
@@ -54,7 +64,7 @@ class LightningOptimizer:
 
     @classmethod
     def _to_lightning_optimizer(
-        cls, optimizer: Union[Optimizer, "LightningOptimizer"], strategy: "pl.strategies.Strategy"
+        cls, optimizer: Union[Optimizer, "LightningOptimizer"], strategy: "pl.strategies.Strategy", opt_idx: int
     ) -> "LightningOptimizer":
         if isinstance(optimizer, LightningOptimizer):
             # the user could return a `LightningOptimizer` from `configure_optimizers`, see test:
@@ -63,6 +73,7 @@ class LightningOptimizer:
         else:
             lightning_optimizer = cls(optimizer)
         lightning_optimizer._strategy = proxy(strategy)
+        lightning_optimizer._optimizer_idx = opt_idx
         return lightning_optimizer
 
     @contextmanager
@@ -83,9 +94,9 @@ class LightningOptimizer:
         lightning_module = self._strategy.lightning_module
         assert lightning_module is not None
         with _block_parallel_sync_behavior(self._strategy, block=(not sync_grad)):
-            lightning_module.toggle_optimizer(self)
+            lightning_module.toggle_optimizer(self, self._optimizer_idx)
             yield
-            lightning_module.untoggle_optimizer(self)
+            lightning_module.untoggle_optimizer(self._optimizer_idx)
 
     def step(self, closure: Optional[Callable[[], Any]] = None, **kwargs: Any) -> Any:
         """Performs a single optimization step (parameter update).
@@ -100,7 +111,7 @@ class LightningOptimizer:
         Example::
 
             # Scenario for a GAN using manual optimization
-            def training_step(self, batch, batch_idx):
+            def training_step(...):
                 opt_gen, opt_dis = self.optimizers()
 
                 ...
@@ -122,7 +133,7 @@ class LightningOptimizer:
 
 
             # A more advanced example
-            def training_step(self, batch, batch_idx):
+            def training_step(self, batch, batch_idx, ...):
                 opt_gen, opt_dis = self.optimizers()
 
                 ...
@@ -155,7 +166,7 @@ class LightningOptimizer:
             raise MisconfigurationException("When `optimizer.step(closure)` is called, the closure should be callable")
 
         assert self._strategy is not None
-        step_output = self._strategy.optimizer_step(self._optimizer, closure, **kwargs)
+        step_output = self._strategy.optimizer_step(self._optimizer, self._optimizer_idx, closure, **kwargs)
 
         self._on_after_step()
 
@@ -164,11 +175,9 @@ class LightningOptimizer:
 
 def _init_optimizers_and_lr_schedulers(
     model: "pl.LightningModule",
-) -> Tuple[List[Optimizer], List[LRSchedulerConfig]]:
+) -> Tuple[List[Optimizer], List[LRSchedulerConfig], List[int]]:
     """Calls `LightningModule.configure_optimizers` and parses and validates the output."""
-    from lightning.pytorch.trainer import call
-
-    optim_conf = call._call_lightning_module_hook(model.trainer, "configure_optimizers", pl_module=model)
+    optim_conf = model.trainer._call_lightning_module_hook("configure_optimizers", pl_module=model)
 
     if optim_conf is None:
         rank_zero_warn(
@@ -176,22 +185,21 @@ def _init_optimizers_and_lr_schedulers(
         )
         optim_conf = _MockOptimizer()
 
-    optimizers, lr_schedulers, monitor = _configure_optimizers(optim_conf)
+    optimizers, lr_schedulers, optimizer_frequencies, monitor = _configure_optimizers(optim_conf)
     lr_scheduler_configs = (
         _configure_schedulers_automatic_opt(lr_schedulers, monitor)
         if model.automatic_optimization
         else _configure_schedulers_manual_opt(lr_schedulers)
     )
-    _validate_multiple_optimizers_support(optimizers, model)
-    _validate_optimizers_attached(optimizers, lr_scheduler_configs)
+    _set_scheduler_opt_idx(optimizers, lr_scheduler_configs)
     _validate_scheduler_api(lr_scheduler_configs, model)
-    return optimizers, lr_scheduler_configs
+    return optimizers, lr_scheduler_configs, optimizer_frequencies
 
 
 def _configure_optimizers(
     optim_conf: Union[Dict[str, Any], List, Optimizer, Tuple]
-) -> Tuple[List, List, Optional[str]]:
-    optimizers, lr_schedulers = [], []
+) -> Tuple[List, List, List, Optional[str]]:
+    optimizers, lr_schedulers, optimizer_frequencies = [], [], []
     monitor = None
 
     # single output, single optimizer
@@ -218,10 +226,23 @@ def _configure_optimizers(
         for opt_dict in optim_conf:
             _validate_optim_conf(opt_dict)
         optimizers = [opt_dict["optimizer"] for opt_dict in optim_conf]
-        scheduler_dict = lambda scheduler: dict(scheduler) if isinstance(scheduler, dict) else {"scheduler": scheduler}
+        scheduler_dict = (
+            lambda scheduler, opt_idx: dict(scheduler, opt_idx=opt_idx)
+            if isinstance(scheduler, dict)
+            else {"scheduler": scheduler, "opt_idx": opt_idx}
+        )
+
         lr_schedulers = [
-            scheduler_dict(opt_dict["lr_scheduler"]) for opt_dict in optim_conf if "lr_scheduler" in opt_dict
+            scheduler_dict(opt_dict["lr_scheduler"], opt_idx)
+            for opt_idx, opt_dict in enumerate(optim_conf)
+            if "lr_scheduler" in opt_dict
         ]
+        optimizer_frequencies = [
+            opt_dict["frequency"] for opt_dict in optim_conf if opt_dict.get("frequency", None) is not None
+        ]
+        # assert that if frequencies are present, they are given for all optimizers
+        if optimizer_frequencies and len(optimizer_frequencies) != len(optimizers):
+            raise ValueError("A frequency must be given to each optimizer.")
     # single list or tuple, multiple optimizer
     elif isinstance(optim_conf, (list, tuple)) and all(isinstance(opt, Optimizable) for opt in optim_conf):
         optimizers = list(optim_conf)
@@ -234,8 +255,9 @@ def _configure_optimizers(
             " * [`Optimizer`]\n"
             " * ([`Optimizer`], [`LRScheduler`])\n"
             ' * {"optimizer": `Optimizer`, (optional) "lr_scheduler": `LRScheduler`}\n'
+            ' * A list of the previously described dict format, with an optional "frequency" key (int)'
         )
-    return optimizers, lr_schedulers, monitor
+    return optimizers, lr_schedulers, optimizer_frequencies, monitor
 
 
 def _configure_schedulers_automatic_opt(schedulers: list, monitor: Optional[str]) -> List[LRSchedulerConfig]:
@@ -300,9 +322,7 @@ def _configure_schedulers_manual_opt(schedulers: list) -> List[LRSchedulerConfig
     lr_scheduler_configs = []
     for scheduler in schedulers:
         if isinstance(scheduler, dict):
-            # interval is not in this list even though the user needs to manually call the scheduler because
-            # the `LearningRateMonitor` callback needs to check its value to know when to log the learning rate
-            invalid_keys = {"reduce_on_plateau", "monitor", "strict"}
+            invalid_keys = {"interval", "frequency", "reduce_on_plateau", "monitor", "strict"}
             keys_to_warn = [k for k in scheduler.keys() if k in invalid_keys]
 
             if keys_to_warn:
@@ -336,25 +356,27 @@ def _validate_scheduler_api(lr_scheduler_configs: List[LRSchedulerConfig], model
             )
 
 
-def _validate_multiple_optimizers_support(optimizers: List[Optimizer], model: "pl.LightningModule") -> None:
-    if model.automatic_optimization and len(optimizers) > 1:
-        raise RuntimeError(
-            "Training with multiple optimizers is only supported with manual optimization. Set"
-            " `self.automatic_optimization = False`, then access your optimizers in `training_step` with"
-            " `opt1, opt2, ... = self.optimizers()`."
-        )
-
-
-def _validate_optimizers_attached(optimizers: List[Optimizer], lr_scheduler_configs: List[LRSchedulerConfig]) -> None:
+def _set_scheduler_opt_idx(optimizers: List[Optimizer], lr_scheduler_configs: List[LRSchedulerConfig]) -> None:
     for config in lr_scheduler_configs:
-        if config.scheduler.optimizer not in optimizers:
+
+        for opt_idx, opt in enumerate(optimizers):
+            if config.scheduler.optimizer is opt:
+                if config.opt_idx is not None and config.opt_idx != opt_idx:
+                    raise MisconfigurationException(
+                        "`opt_idx` set inside scheduler config does not match with the index"
+                        " of the respective optimizer returned from `configure_optimizers`."
+                    )
+
+                config.opt_idx = opt_idx
+                break
+        else:
             raise MisconfigurationException(
                 "Some schedulers are attached with an optimizer that wasn't returned from `configure_optimizers`."
             )
 
 
 def _validate_optim_conf(optim_conf: Dict[str, Any]) -> None:
-    valid_keys = {"optimizer", "lr_scheduler", "monitor"}
+    valid_keys = {"optimizer", "lr_scheduler", "frequency", "monitor"}
     extra_keys = optim_conf.keys() - valid_keys
     if extra_keys:
         rank_zero_warn(

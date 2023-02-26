@@ -1,4 +1,4 @@
-# Copyright The Lightning AI team.
+# Copyright The PyTorch Lightning team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Literal
 
 import torch
 from torch import Tensor
@@ -24,7 +23,7 @@ from lightning.fabric.plugins.precision.utils import _convert_fp_tensor
 class TPUBf16Precision(TPUPrecision):
     """Plugin that enables bfloats on TPUs."""
 
-    precision: Literal["bf16-mixed"] = "bf16-mixed"
+    precision: str = "bf16"
 
     def __init__(self) -> None:
         super().__init__()
