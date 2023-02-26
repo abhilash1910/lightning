@@ -46,8 +46,11 @@ class XPUAccelerator(Accelerator):
         # TODO refactor input from trainer to local_rank @four4fish
         # self.set_intel_flags(trainer.local_rank)
         # clear cache before training
-        torch.xpu.empty_cache()
-
+        try: 
+            torch.xpu.empty_cache()
+        except AttributeError:
+            pass
+            
     # @staticmethod
     # def set_intel_flags(local_rank: int) -> None:
     #    # set the correct xpu visible devices (using pci order)
@@ -69,8 +72,11 @@ class XPUAccelerator(Accelerator):
 
     def teardown(self) -> None:
         # clean up memory
-        torch.xpu.empty_cache()
-
+        try: 
+            torch.xpu.empty_cache()
+        except AttributeError:
+            pass
+        
     @staticmethod
     def parse_devices(devices: Union[int, str, List[int]]) -> Optional[List[int]]:
         """Accelerator device parsing logic."""

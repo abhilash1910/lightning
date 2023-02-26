@@ -82,6 +82,7 @@ class UnrepeatedDistributedSampler(DistributedSampler):
             raise TypeError("The given dataset must implement the `__len__` method.")
         if self.shuffle:
             # deterministically shuffle based on epoch
+            #To-Do: Change torch.Generator API
             g = torch.Generator()
             g.manual_seed(self.epoch)
             indices = torch.randperm(len(self.dataset), generator=g).tolist()

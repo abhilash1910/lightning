@@ -22,6 +22,14 @@ if _TORCH_DISTRIBUTED_AVAILABLE:
 # The code underneath is taken from PyTorch `torch/distributed/distributed_c10d.py`
 # the distributed backend and tensor type updates for habana backend is done here before broadcast
 
+try:
+    import oneccl_bindings_for_pytorch as torch_ccl
+
+    rank_zero_info(f"Using Intel(R) oneCCL Bindings for PyTorch* {torch_ccl.__version__}")
+except ImportError:
+    rank_zero_info(f"Unable to initialize Intel(R) oneCCL Bindings for PyTorch")
+    pass
+
 
 # Taken from https://github.com/pytorch/pytorch/blob/3466c1b6901f06a563b8cbfa3c942fa50bda835b/torch/distributed/distributed_c10d.py#L267 # noqa: E501
 def _rank_not_in_group(group: "ProcessGroup"):
@@ -124,7 +132,7 @@ def _broadcast_object_list(object_list, src=0, group=None, device=None):
             raise ValueError("device type must be cuda for nccl backend")
         if is_ccl_backend and device.type != "xpu":
             raise ValueError(
-                "device type must be xpu for ccprovide perf breakdown using current IPEX masternnl backend"
+                "device type must be xpu for ccl provide perf breakdown using current IPEX master dnnl backend"
             )
         current_device = device
     else:
