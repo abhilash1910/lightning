@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,32 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import logging
 import os
 import re
-from copy import deepcopy
 from typing import Any, Dict, Optional
 
 import torch
 from fsspec.core import url_to_fs
 from fsspec.implementations.local import LocalFileSystem
 from torch import Tensor
-from torchmetrics import Metric
 
 import lightning.pytorch as pl
 from lightning.fabric.plugins.environments.slurm import SLURMEnvironment
 from lightning.fabric.utilities.cloud_io import get_filesystem
 from lightning.fabric.utilities.types import _PATH
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.plugins.precision import ApexMixedPrecisionPlugin, MixedPrecisionPlugin
+from lightning.pytorch.plugins.precision import MixedPrecisionPlugin
+from lightning.pytorch.trainer import call
 from lightning.pytorch.trainer.states import TrainerFn
 from lightning.pytorch.utilities import _OMEGACONF_AVAILABLE
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
-from lightning.pytorch.utilities.imports import _fault_tolerant_training
 from lightning.pytorch.utilities.migration import pl_legacy_patch
 from lightning.pytorch.utilities.migration.utils import _pl_migrate_checkpoint
-from lightning.pytorch.utilities.rank_zero import rank_zero_deprecation, rank_zero_info, rank_zero_warn
+from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_warn
 
 if _OMEGACONF_AVAILABLE:
     from omegaconf import Container
@@ -46,16 +43,11 @@ log: logging.Logger = logging.getLogger(__name__)
 
 
 class CheckpointConnector:
-    def __init__(self, trainer: "pl.Trainer", resume_from_checkpoint: Optional[_PATH] = None) -> None:
+    def __init__(self, trainer: "pl.Trainer") -> None:
         self.trainer = trainer
-        self.resume_checkpoint_path: Optional[_PATH] = None
-        # TODO: remove resume_from_checkpoint_fit_path in v2.0
-        self.resume_from_checkpoint_fit_path: Optional[_PATH] = resume_from_checkpoint
-        if resume_from_checkpoint is not None:
-            rank_zero_deprecation(
-                "Setting `Trainer(resume_from_checkpoint=)` is deprecated in v1.5 and"
-                " will be removed in v2.0. Please pass `Trainer.fit(ckpt_path=)` directly instead."
-            )
+        self._ckpt_path: Optional[_PATH] = None
+        # flag to know if the user is changing the checkpoint path statefully. See `trainer.ckpt_path.setter`
+        self._user_managed: bool = False
         self._loaded_checkpoint: Dict[str, Any] = {}
 
     @property
@@ -80,9 +72,9 @@ class CheckpointConnector:
         3. from `checkpoint_path` file if provided
         4. don't restore
         """
-        self.resume_checkpoint_path = checkpoint_path
+        self._ckpt_path = checkpoint_path
         if not checkpoint_path:
-            log.detail("`checkpoint_path` not specified. Skipping checkpoint loading.")
+            log.debug("`checkpoint_path` not specified. Skipping checkpoint loading.")
             return
 
         rank_zero_info(f"Restoring states from the checkpoint path at {checkpoint_path}")
@@ -90,21 +82,53 @@ class CheckpointConnector:
             loaded_checkpoint = self.trainer.strategy.load_checkpoint(checkpoint_path)
         self._loaded_checkpoint = _pl_migrate_checkpoint(loaded_checkpoint, checkpoint_path)
 
-    def _set_ckpt_path(
-        self, state_fn: TrainerFn, ckpt_path: Optional[str], model_provided: bool, model_connected: bool
-    ) -> Optional[str]:
+    def _select_ckpt_path(
+        self, state_fn: TrainerFn, ckpt_path: Optional[_PATH], model_provided: bool, model_connected: bool
+    ) -> Optional[_PATH]:
+        """Called by the ``Trainer`` to select the checkpoint path source."""
+        if self._user_managed:
+            if ckpt_path:
+                rank_zero_warn(
+                    f"`trainer.ckpt_path = {self._ckpt_path!r}` was called but then you"
+                    f" passed `trainer.fit(ckpt_path={ckpt_path!r})`. The latter will be loaded."
+                )
+                # reset the previous path
+                self._ckpt_path = None
+                self._user_managed = False
+                ckpt_path = self._parse_ckpt_path(
+                    state_fn,
+                    ckpt_path,
+                    model_provided=model_provided,
+                    model_connected=model_connected,
+                )
+            else:
+                ckpt_path = self._ckpt_path
+        else:
+            ckpt_path = self._parse_ckpt_path(
+                state_fn,
+                ckpt_path,
+                model_provided=model_provided,
+                model_connected=model_connected,
+            )
+        return ckpt_path
+
+    def _parse_ckpt_path(
+        self, state_fn: TrainerFn, ckpt_path: Optional[_PATH], model_provided: bool, model_connected: bool
+    ) -> Optional[_PATH]:
+        """Converts the ``ckpt_path`` special values into an actual filepath, depending on the trainer
+        configuration."""
         if ckpt_path is None and SLURMEnvironment.detect() and self._hpc_resume_path is not None:
             ckpt_path = "hpc"
 
-        from lightning.pytorch.callbacks.fault_tolerance import _FaultToleranceCheckpoint
+        from lightning.pytorch.callbacks.on_exception_checkpoint import OnExceptionCheckpoint
 
-        ft_checkpoints = [cb for cb in self.trainer.callbacks if isinstance(cb, _FaultToleranceCheckpoint)]
+        ft_checkpoints = [cb for cb in self.trainer.callbacks if isinstance(cb, OnExceptionCheckpoint)]
         fn = state_fn.value
         if ckpt_path is None and ft_checkpoints and self.trainer.state.fn == TrainerFn.FITTING:
             ckpt_path = "last"
             rank_zero_warn(
                 f"`.{fn}(ckpt_path=None)` was called without a model."
-                " Because fault tolerance is enabled, the last model of the previous `fit` call will be used."
+                " The last model of the previous `fit` call will be used."
                 f" You can pass `{fn}(ckpt_path='best')` to use the best model or"
                 f" `{fn}(ckpt_path='last')` to use the last model."
                 " If you pass a value, this warning will be silenced."
@@ -117,7 +141,7 @@ class CheckpointConnector:
         if model_connected and ckpt_path is None:
             ckpt_path = "best"
             ft_tip = (
-                " There is also a fault-tolerant checkpoint available, however it is used by default only when fitting."
+                " There is also an on-exception checkpoint available, however it is used by default only when fitting."
                 if ft_checkpoints
                 else ""
             )
@@ -163,8 +187,8 @@ class CheckpointConnector:
             if not candidates_ts:
                 # not an error so it can be set and forget before the first `fit` run
                 rank_zero_warn(
-                    f'.{fn}(ckpt_path="last") is set, but there is no fault tolerant'
-                    " or last checkpoint available. No checkpoint will be loaded."
+                    f'.{fn}(ckpt_path="last") is set, but there is no last checkpoint available.'
+                    " No checkpoint will be loaded."
                 )
                 return None
             ckpt_path = max(candidates_ts, key=candidates_ts.get)  # type: ignore[arg-type]
@@ -188,22 +212,17 @@ class CheckpointConnector:
         """Signal the connector that all states have resumed and memory for the checkpoint object can be
         released."""
         assert self.trainer.state.fn is not None
-        if self.resume_checkpoint_path:
-            if self.trainer.state.fn == TrainerFn.FITTING:
-                rank_zero_info(f"Restored all states from the checkpoint file at {self.resume_checkpoint_path}")
-            elif self.trainer.state.fn in (TrainerFn.VALIDATING, TrainerFn.TESTING, TrainerFn.PREDICTING):
-                rank_zero_info(f"Loaded model weights from checkpoint at {self.resume_checkpoint_path}")
-        # TODO: remove resume_from_checkpoint_fit_path in v2.0
-        if (
-            self.trainer.state.fn == TrainerFn.FITTING
-            and self.resume_checkpoint_path == self.resume_from_checkpoint_fit_path
-        ):
-            self.resume_from_checkpoint_fit_path = None
-        self.resume_checkpoint_path = None
-        self._loaded_checkpoint = {}
+        if self._ckpt_path:
+            message = "Restored all states" if self.trainer.state.fn == TrainerFn.FITTING else "Loaded model weights"
+            rank_zero_info(f"{message} from the checkpoint at {self._ckpt_path}")
 
-        # clear cache after restore
+        # free memory
+        self._loaded_checkpoint = {}
         torch.cuda.empty_cache()
+        try:
+            torch.xpu.empty_cache()
+        except AttributeError:
+            pass
 
         # wait for all to catch up
         self.trainer.strategy.barrier("CheckpointConnector.resume_end")
@@ -239,10 +258,11 @@ class CheckpointConnector:
         if not self._loaded_checkpoint:
             return
 
-        datamodule = self.trainer.datamodule
+        trainer = self.trainer
+        datamodule = trainer.datamodule
         if datamodule is not None and datamodule.__class__.__qualname__ in self._loaded_checkpoint:
-            self.trainer._call_lightning_datamodule_hook(
-                "load_state_dict", self._loaded_checkpoint[datamodule.__class__.__qualname__]
+            call._call_lightning_datamodule_hook(
+                trainer, "load_state_dict", self._loaded_checkpoint[datamodule.__class__.__qualname__]
             )
 
     def restore_model(self) -> None:
@@ -254,17 +274,12 @@ class CheckpointConnector:
         if not self._loaded_checkpoint:
             return
 
+        trainer = self.trainer
         # hook: give user access to checkpoint if needed.
-        self.trainer._call_lightning_module_hook("on_load_checkpoint", self._loaded_checkpoint)
+        call._call_lightning_module_hook(trainer, "on_load_checkpoint", self._loaded_checkpoint)
 
         # restore model state_dict
-        self.trainer.strategy.load_model_state_dict(self._loaded_checkpoint)
-
-        # reset metrics states on non-rank 0 as all states have been accumulated on rank 0 via syncing on checkpointing.
-        if not self.trainer.is_global_zero:
-            for module in self.trainer.lightning_module.modules():
-                if isinstance(module, Metric):
-                    module.reset()
+        trainer.strategy.load_model_state_dict(self._loaded_checkpoint)
 
     def restore_training_state(self) -> None:
         """Restore the trainer state from the pre-loaded checkpoint.
@@ -293,44 +308,17 @@ class CheckpointConnector:
             prec_plugin.load_state_dict(self._loaded_checkpoint[prec_plugin.__class__.__qualname__])
 
         # old checkpoints compatibility
-        if "amp_scaling_state" in self._loaded_checkpoint and isinstance(prec_plugin, ApexMixedPrecisionPlugin):
-            prec_plugin.load_state_dict(self._loaded_checkpoint["amp_scaling_state"])
         if "native_amp_scaling_state" in self._loaded_checkpoint and isinstance(prec_plugin, MixedPrecisionPlugin):
             prec_plugin.load_state_dict(self._loaded_checkpoint["native_amp_scaling_state"])
-
-    def _restore_quantization_callbacks(self) -> None:
-        """Restores all the ``QuantizationAwareTraining`` callbacks from the pre-loaded checkpoint.
-
-        The implementation is similar to :meth:`restore_callbacks` but calls the QAT callback with a special hook
-        `load_before_model` instead of `load_state_dict`.
-        """
-        if not self._loaded_checkpoint:
-            return
-
-        callback_states = self._loaded_checkpoint.get("callbacks")
-
-        if callback_states is None:
-            return
-
-        from lightning.pytorch.callbacks.quantization import QuantizationAwareTraining  # avoid circular import
-
-        for callback in self.trainer.callbacks:
-            if not isinstance(callback, QuantizationAwareTraining):
-                continue
-
-            state = callback_states.get(callback.state_key, callback_states.get(callback._legacy_state_key))
-            if state:
-                # The Quantization callbacks have a special method that must be called before restoring the weights
-                # of the model
-                callback._load_before_model(self.trainer.lightning_module, deepcopy(state))
 
     def restore_callbacks(self) -> None:
         """Restores all callbacks from the pre-loaded checkpoint."""
         if not self._loaded_checkpoint:
             return
 
-        self.trainer._call_callbacks_on_load_checkpoint(self._loaded_checkpoint)
-        self.trainer._call_callbacks_load_state_dict(self._loaded_checkpoint)
+        trainer = self.trainer
+        call._call_callbacks_on_load_checkpoint(trainer, self._loaded_checkpoint)
+        call._call_callbacks_load_state_dict(trainer, self._loaded_checkpoint)
 
     def restore_loops(self) -> None:
         """Restores the loop progress from the pre-loaded checkpoint.
@@ -406,9 +394,14 @@ class CheckpointConnector:
         for config, lrs_state in zip(self.trainer.lr_scheduler_configs, lr_schedulers):
             config.scheduler.load_state_dict(lrs_state)
 
-    # ----------------------------------
-    # PRIVATE OPS
-    # ----------------------------------
+    def _restore_modules_and_callbacks(self, checkpoint_path: Optional[_PATH] = None) -> None:
+        # restore modules after setup
+        self.resume_start(checkpoint_path)
+        self.restore_model()
+        self.restore_datamodule()
+        if self.trainer.state.fn == TrainerFn.FITTING:
+            # restore callback states
+            self.restore_callbacks()
 
     def dump_checkpoint(self, weights_only: bool = False) -> dict:
         """Creating a model checkpoint dictionary object from various component states.
@@ -431,13 +424,14 @@ class CheckpointConnector:
                 LightningDataModule.__class__.__qualname__: pl DataModule's state
             }
         """
-        model = self.trainer.lightning_module
-        datamodule = self.trainer.datamodule
+        trainer = self.trainer
+        model = trainer.lightning_module
+        datamodule = trainer.datamodule
 
         checkpoint = {
             # the epoch and global step are saved for compatibility but they are not relevant for restoration
-            "epoch": self.trainer.current_epoch,
-            "global_step": self.trainer.global_step,
+            "epoch": trainer.current_epoch,
+            "global_step": trainer.global_step,
             "pytorch-lightning_version": pl.__version__,
             "state_dict": self._get_lightning_module_state_dict(),
             "loops": self._get_loops_state_dict(),
@@ -445,24 +439,24 @@ class CheckpointConnector:
 
         if not weights_only:
             # dump callbacks
-            checkpoint["callbacks"] = self.trainer._call_callbacks_state_dict()
+            checkpoint["callbacks"] = call._call_callbacks_state_dict(trainer)
 
             optimizer_states = []
-            for i, optimizer in enumerate(self.trainer.optimizers):
+            for i, optimizer in enumerate(trainer.optimizers):
                 # Rely on accelerator to dump optimizer state
-                optimizer_state = self.trainer.strategy.optimizer_state(optimizer)
+                optimizer_state = trainer.strategy.optimizer_state(optimizer)
                 optimizer_states.append(optimizer_state)
 
             checkpoint["optimizer_states"] = optimizer_states
 
             # dump lr schedulers
             lr_schedulers = []
-            for config in self.trainer.lr_scheduler_configs:
+            for config in trainer.lr_scheduler_configs:
                 lr_schedulers.append(config.scheduler.state_dict())
             checkpoint["lr_schedulers"] = lr_schedulers
 
             # precision plugin
-            prec_plugin = self.trainer.precision_plugin
+            prec_plugin = trainer.precision_plugin
             prec_plugin_state_dict = prec_plugin.state_dict()
             if prec_plugin_state_dict:
                 checkpoint[prec_plugin.__class__.__qualname__] = prec_plugin_state_dict
@@ -481,9 +475,8 @@ class CheckpointConnector:
                     checkpoint[obj.CHECKPOINT_HYPER_PARAMS_KEY] = dict(obj.hparams)
 
         # dump stateful datamodule
-        datamodule = self.trainer.datamodule
         if datamodule is not None:
-            datamodule_state_dict = self.trainer._call_lightning_datamodule_hook("state_dict")
+            datamodule_state_dict = call._call_lightning_datamodule_hook(trainer, "state_dict")
             if datamodule_state_dict:
                 checkpoint[datamodule.__class__.__qualname__] = datamodule_state_dict
 
@@ -493,8 +486,8 @@ class CheckpointConnector:
             # it overrides the returned state from callback's state_dict
             # support for returning state in on_save_checkpoint
             # will be removed in v1.8
-            self.trainer._call_callbacks_on_save_checkpoint(checkpoint)
-        self.trainer._call_lightning_module_hook("on_save_checkpoint", checkpoint)
+            call._call_callbacks_on_save_checkpoint(trainer, checkpoint)
+        call._call_lightning_module_hook(trainer, "on_save_checkpoint", checkpoint)
         return checkpoint
 
     def save_checkpoint(
@@ -511,24 +504,7 @@ class CheckpointConnector:
         self.trainer.strategy.save_checkpoint(_checkpoint, filepath, storage_options=storage_options)
 
     def _get_lightning_module_state_dict(self) -> Dict[str, Tensor]:
-        metrics = (
-            [m for m in self.trainer.lightning_module.modules() if isinstance(m, Metric)]
-            if _fault_tolerant_training()
-            else []
-        )
-
-        for metric in metrics:
-            metric.persistent(True)
-            metric.sync()
-
-        state_dict = self.trainer.strategy.lightning_module_state_dict()
-
-        for metric in metrics:
-            # sync can be a no-op (e.g. on cpu) so `unsync` would raise a user error exception if we don't check
-            if metric._is_synced:
-                metric.unsync()
-
-        return state_dict
+        return self.trainer.strategy.lightning_module_state_dict()
 
     def _get_loops_state_dict(self) -> Dict[str, Any]:
         return {

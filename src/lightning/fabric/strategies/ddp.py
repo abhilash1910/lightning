@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,14 +13,13 @@
 # limitations under the License.
 from contextlib import contextmanager
 from datetime import timedelta
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, List, Literal, Optional, Union
 
 import torch
 import torch.distributed
 from torch import Tensor
 from torch.nn import Module
 from torch.nn.parallel.distributed import DistributedDataParallel
-from typing_extensions import Literal
 
 from lightning.fabric.accelerators.accelerator import Accelerator
 from lightning.fabric.plugins.collectives.torch_collective import default_pg_timeout
@@ -82,10 +81,6 @@ class DDPStrategy(ParallelStrategy):
         return self.parallel_devices[self.local_rank]
 
     @property
-    def is_distributed(self) -> bool:
-        return True
-
-    @property
     def num_nodes(self) -> int:
         return self._num_nodes
 
@@ -124,7 +119,7 @@ class DDPStrategy(ParallelStrategy):
     def module_to_device(self, module: Module) -> None:
         module.to(self.root_device)
 
-    def reduce(
+    def all_reduce(
         self, tensor: Tensor, group: Optional[Any] = None, reduce_op: Optional[Union[ReduceOp, str]] = "mean"
     ) -> Tensor:
         """Reduces a tensor from several distributed processes to one aggregated tensor.
@@ -158,6 +153,11 @@ class DDPStrategy(ParallelStrategy):
             obj = [None]  # type: ignore[list-item]
         torch.distributed.broadcast_object_list(obj, src, group=_group.WORLD)
         return obj[0]
+
+    def get_module_state_dict(self, module: Module) -> Dict[str, Union[Any, Tensor]]:
+        if isinstance(module, DistributedDataParallel):
+            module = module.module
+        return super().get_module_state_dict(module)
 
     @classmethod
     def register_strategies(cls, strategy_registry: Dict) -> None:

@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,30 +16,26 @@ import os
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, cast, Dict, Generator, List, Optional, overload, Sequence, Tuple, Union
+from typing import Any, Callable, cast, Dict, Generator, List, Mapping, Optional, overload, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 from lightning_utilities.core.apply_func import apply_to_collection
 from lightning_utilities.core.overrides import is_overridden
+from lightning_utilities.core.rank_zero import rank_zero_warn
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.utils.data import BatchSampler, DataLoader, DistributedSampler, RandomSampler, SequentialSampler
 
+from lightning.fabric.loggers import Logger
+
 from lightning.fabric.plugins import Precision  # avoid circular imports: # isort: split
 from lightning.fabric.accelerators.accelerator import Accelerator
 from lightning.fabric.connector import _Connector, _PLUGIN_INPUT, _PRECISION_INPUT
-from lightning.fabric.strategies import (
-    DDPShardedStrategy,
-    DeepSpeedStrategy,
-    FSDPStrategy,
-    SingleDeviceStrategy,
-    Strategy,
-    XLAStrategy,
-)
+from lightning.fabric.strategies import DeepSpeedStrategy, FSDPStrategy, SingleDeviceStrategy, Strategy, XLAStrategy
 from lightning.fabric.strategies.strategy import _Sharded, TBroadcast
 from lightning.fabric.utilities import move_data_to_device
-from lightning.fabric.utilities.apply_func import convert_to_tensors
+from lightning.fabric.utilities.apply_func import convert_tensors_to_scalars, convert_to_tensors
 from lightning.fabric.utilities.data import (
     _auto_add_worker_init_fn,
     _replace_dunder_methods,
@@ -47,10 +43,10 @@ from lightning.fabric.utilities.data import (
     has_iterable_dataset,
 )
 from lightning.fabric.utilities.distributed import DistributedSamplerWrapper
-from lightning.fabric.utilities.rank_zero import rank_zero_warn
 from lightning.fabric.utilities.seed import seed_everything
+from lightning.fabric.utilities.types import ReduceOp
 from lightning.fabric.utilities.warnings import PossibleUserWarning
-from lightning.fabric.wrappers import _FabricDataLoader, _FabricModule, _FabricOptimizer
+from lightning.fabric.wrappers import _FabricDataLoader, _FabricModule, _FabricOptimizer, _unwrap_objects
 
 
 class Fabric:
@@ -65,26 +61,31 @@ class Fabric:
 
     Args:
         accelerator: The hardware to run on. Possible choices are:
-            ``"cpu"``, ``"cuda"``, ``"mps"``, ``"gpu"``, ``"tpu"``, ``"auto"``.
+            ``"cpu"``, ``"xpu"``, ``"cuda"``, ``"mps"``, ``"gpu"``, ``"tpu"``, ``"auto"``.
         strategy: Strategy for how to run across multiple devices. Possible choices are:
-            ``"dp"``, ``"ddp"``, ``"ddp_spawn"``, ``"deepspeed"``, ``"ddp_sharded"``.
+            ``"dp"``, ``"ddp"``, ``"ddp_spawn"``, ``"deepspeed"``, ``"fsdp"``.
         devices: Number of devices to train on (``int``), which GPUs to train on (``list`` or ``str``), or ``"auto"``.
             The value applies per node.
         num_nodes: Number of GPU nodes for distributed training.
-        precision: Double precision (``64``), full precision (``32``), half precision (``16``),
-            or bfloat16 precision (``"bf16"``).
+        precision: Double precision (``"64-true"``), full precision (``"32"``), half precision AMP (``"16-mixed"``),
+            or bfloat16 precision AMP (``"bf16-mixed"``).
         plugins: One or several custom plugins
+        callbacks: A single callback or a list of callbacks. A callback can contain any arbitrary methods that
+            can be invoked through :meth:`~lightning.fabric.fabric.Fabric.call` by the user.
+        loggers: A single logger or a list of loggers. See :meth:`~lightning.fabric.fabric.Fabric.log` for more
+            information.
     """
 
     def __init__(
         self,
-        accelerator: Optional[Union[str, Accelerator]] = None,
-        strategy: Optional[Union[str, Strategy]] = None,
-        devices: Optional[Union[List[int], str, int]] = None,
+        accelerator: Union[str, Accelerator] = "auto",
+        strategy: Union[str, Strategy] = "auto",
+        devices: Union[List[int], str, int] = "auto",
         num_nodes: int = 1,
-        precision: _PRECISION_INPUT = 32,
+        precision: _PRECISION_INPUT = "32-true",
         plugins: Optional[Union[_PLUGIN_INPUT, List[_PLUGIN_INPUT]]] = None,
         callbacks: Optional[Union[List[Any], Any]] = None,
+        loggers: Optional[Union[Logger, List[Logger]]] = None,
     ) -> None:
         self._connector = _Connector(
             accelerator=accelerator,
@@ -99,6 +100,8 @@ class Fabric:
         self._precision: Precision = self._strategy.precision
         callbacks = callbacks if callbacks is not None else []
         self._callbacks = callbacks if isinstance(callbacks, list) else [callbacks]
+        loggers = loggers if loggers is not None else []
+        self._loggers = loggers if isinstance(loggers, list) else [loggers]
         self._models_setup: int = 0
 
         self._prepare_run_method()
@@ -147,6 +150,16 @@ class Fabric:
     def is_global_zero(self) -> bool:
         """Whether this rank is rank zero."""
         return self._strategy.is_global_zero
+
+    @property
+    def loggers(self) -> List[Logger]:
+        """Returns all loggers passed to Fabric."""
+        return self._loggers
+
+    @property
+    def logger(self) -> Logger:
+        """Returns the first logger in the list passed to Fabric, which is considered the main logger."""
+        return self._loggers[0]
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
         """All the code inside this run method gets accelerated by Fabric.
@@ -260,15 +273,16 @@ class Fabric:
         return optimizers[0] if len(optimizers) == 1 else tuple(optimizers)
 
     def setup_dataloaders(
-        self, *dataloaders: DataLoader, replace_sampler: bool = True, move_to_device: bool = True
+        self, *dataloaders: DataLoader, use_distributed_sampler: bool = True, move_to_device: bool = True
     ) -> Union[DataLoader, List[DataLoader]]:
         """Set up one or multiple dataloaders for accelerated training. If you need different settings for each
         dataloader, call this method individually for each one.
 
         Args:
             *dataloaders: A single dataloader or a sequence of dataloaders.
-            replace_sampler: If set ``True`` (default), automatically wraps or replaces the sampler on the dataloader(s)
-                for distributed training. If you have a custom sampler defined, set this to this argument to ``False``.
+            use_distributed_sampler: If set ``True`` (default), automatically wraps or replaces the sampler on the
+                dataloader(s) for distributed training. If you have a custom sampler defined, set this argument
+                to ``False``.
             move_to_device: If set ``True`` (default), moves the data returned by the dataloader(s) automatically to
                 the correct device. Set this to ``False`` and alternatively use :meth:`to_device` manually on the
                 returned data.
@@ -278,21 +292,24 @@ class Fabric:
         """
         self._validate_setup_dataloaders(dataloaders)
         dataloaders = [
-            self._setup_dataloader(dataloader, replace_sampler=replace_sampler, move_to_device=move_to_device)
+            self._setup_dataloader(
+                dataloader, use_distributed_sampler=use_distributed_sampler, move_to_device=move_to_device
+            )
             for dataloader in dataloaders
         ]
         dataloaders = dataloaders[0] if len(dataloaders) == 1 else dataloaders
         return dataloaders  # type: ignore[return-value]
 
     def _setup_dataloader(
-        self, dataloader: DataLoader, replace_sampler: bool = True, move_to_device: bool = True
+        self, dataloader: DataLoader, use_distributed_sampler: bool = True, move_to_device: bool = True
     ) -> DataLoader:
         """Set up a single dataloader for accelerated training.
 
         Args:
             dataloader: The dataloader to accelerate.
-            replace_sampler: If set ``True`` (default), automatically wraps or replaces the sampler on the dataloader
-                for distributed training. If you have a custom sampler defined, set this to this argument to ``False``.
+            use_distributed_sampler: If set ``True`` (default), automatically wraps or replaces the sampler on the
+                dataloader for distributed training. If you have a custom sampler defined, set this argument to
+                ``False``.
             move_to_device: If set ``True`` (default), moves the data returned by the dataloader automatically to
                 the correct device. Set this to ``False`` and alternatively use :meth:`to_device` manually on the
                 returned data.
@@ -301,7 +318,7 @@ class Fabric:
             The wrapped dataloader.
         """
         sampler = dataloader.sampler
-        if replace_sampler and self._requires_distributed_sampler(dataloader):
+        if use_distributed_sampler and self._requires_distributed_sampler(dataloader):
             sampler = self._get_distributed_sampler(dataloader, **self._strategy.distributed_sampler_kwargs)
 
         # the dataloader needs to be re-instantiated because we want to update the input arguments (e.g., sampler)
@@ -394,30 +411,34 @@ class Fabric:
             print(*args, **kwargs)
 
     def barrier(self, name: Optional[str] = None) -> None:
-        """Wait for all processes to enter this call. Use this to synchronize all parallel processes, but only if
-        necessary, otherwise the overhead of synchronization will cause your program to slow down.
+        """Wait for all processes to enter this call.
 
-        Example::
-
-            if self.global_rank == 0:
-                # let process 0 download the dataset
-                dataset.download_files()
-
-            # let all processes wait before reading the dataset
-            self.barrier()
-
-            # now all processes can read the files and start training
+        Use this to synchronize all parallel processes, but only if necessary, otherwise the overhead of synchronization
+        will cause your program to slow down.
         """
         self._strategy.barrier(name=name)
+
+    def broadcast(self, obj: TBroadcast, src: int = 0) -> TBroadcast:
+        """Send a tensor from one process to all others.
+
+        Args:
+            obj: The object to broadcast to all other members. Any serializable object is supported, but it is
+                most efficient with the object being a :class:`~torch.Tensor`.
+            src: The (global) rank of the process that should send the data to all others.
+
+        Return:
+            The transferred data, the same value on every rank.
+        """
+        return self._strategy.broadcast(obj, src=src)
 
     def all_gather(
         self, data: Union[Tensor, Dict, List, Tuple], group: Optional[Any] = None, sync_grads: bool = False
     ) -> Union[Tensor, Dict, List, Tuple]:
-        r"""Gather tensors or collections of tensors from multiple processes.
+        """Gather tensors or collections of tensors from multiple processes.
 
         Args:
             data: int, float, tensor of shape (batch, ...), or a (possibly nested) collection thereof.
-            group: the process group to gather results from. Defaults to all processes (world)
+            group: the process group to gather results from. Defaults to all processes (world).
             sync_grads: flag that allows users to synchronize gradients for the all_gather operation
 
         Return:
@@ -428,8 +449,27 @@ class Fabric:
         data = convert_to_tensors(data, device=self.device)
         return apply_to_collection(data, Tensor, self._strategy.all_gather, group=group, sync_grads=sync_grads)
 
-    def broadcast(self, obj: TBroadcast, src: int = 0) -> TBroadcast:
-        return self._strategy.broadcast(obj, src=src)
+    def all_reduce(
+        self,
+        data: Union[Tensor, Dict, List, Tuple],
+        group: Optional[Any] = None,
+        reduce_op: Optional[Union[ReduceOp, str]] = "mean",
+    ) -> Union[Tensor, Dict, List, Tuple]:
+        """Reduce tensors or collections of tensors from multiple processes.
+
+        Args:
+            data: int, float, tensor of shape (batch, ...), or a (possibly nested) collection thereof.
+            group: the process group to reduce results across. Defaults to all processes (world).
+            reduce_op: the reduction operation. Defaults to 'mean'. Can also be a string 'sum' or ReduceOp.
+                Some strategies may limit the choices here.
+
+        Return:
+            A tensor of the same shape as the input with values reduced pointwise across processes. The same is
+            applied to tensors in a collection if a collection is given as input.
+        """
+        group = group if group is not None else torch.distributed.group.WORLD
+        data = convert_to_tensors(data, device=self.device)
+        return apply_to_collection(data, Tensor, self._strategy.all_reduce, group=group, reduce_op=reduce_op)
 
     @contextmanager
     def no_backward_sync(self, module: _FabricModule, enabled: bool = True) -> Generator:
@@ -496,27 +536,36 @@ class Fabric:
         else:
             yield
 
-    def save(self, content: Dict[str, Any], filepath: Union[str, Path]) -> None:
+    def save(self, path: Union[str, Path], state: Dict[str, Union[nn.Module, Optimizer, Any]]) -> None:
         """Save checkpoint contents to a file.
 
         How and which processes save gets determined by the `strategy`. For example, the `ddp` strategy
-        saves checkpoints only on process 0.
+        saves checkpoints only on process 0, while the `fsdp` strategy saves files from every rank.
 
         Args:
-            content: A dictionary with contents, i.e., the state dict of your model
-            filepath: A path to where the file should be saved
+            path: A path to where the file(s) should be saved
+            state: A dictionary with contents to be saved. If the dict contains modules or optimizers, their
+                state-dict will be retrieved and converted automatically.
         """
-        self._strategy.save_checkpoint(content, filepath)
+        return self._strategy.save_checkpoint(path=path, state=_unwrap_objects(state))
 
-    def load(self, filepath: Union[str, Path]) -> Any:
-        """Load a checkpoint from a file.
+    def load(
+        self, path: Union[str, Path], state: Optional[Dict[str, Union[nn.Module, Optimizer, Any]]] = None
+    ) -> Dict[str, Any]:
+        """Load a checkpoint from a file and restore the state of objects (modules, optimizers, etc.)
 
         How and which processes load gets determined by the `strategy`
 
         Args:
-            filepath: A path to where the file is located
+            path: A path to where the file is located
+            state: A dictionary of objects whose state will be restored in-place from the checkpoint path.
+                If no state is given, then the checkpoint will be returned in full.
+
+        Returns:
+            The remaining items that were not restored into the given state dictionary. If no state dictionary is
+            given, the full checkpoint will be returned.
         """
-        return self._strategy.load_checkpoint(filepath)
+        return self._strategy.load_checkpoint(path=path, state=state)
 
     def launch(self, function: Optional[Callable[["Fabric"], Any]] = None, *args: Any, **kwargs: Any) -> Any:
         if _is_using_cli():
@@ -552,7 +601,7 @@ class Fabric:
                 def on_train_epoch_end(self, results):
                     ...
 
-            fabric = Fabric(callbacks=[MyCallback]))
+            fabric = Fabric(callbacks=[MyCallback()])
             fabric.call("on_train_epoch_end", results={...})
         """
         for callback in self._callbacks:
@@ -572,6 +621,31 @@ class Fabric:
             # method(self, fabric|trainer, *args, x, y=1)
             # method(self, *args, y=1)
             # method(self, *args, **kwargs)
+
+    def log(self, name: str, value: Any, step: Optional[int] = None) -> None:
+        """Log a scalar to all loggers that were added to Fabric.
+
+        Args:
+            name: The name of the metric to log.
+            value: The metric value to collect. If the value is a :class:`torch.Tensor`, it gets detached from the
+                graph automatically.
+            step: Optional step number. Most Logger implementations auto-increment the step value by one with every
+                log call. You can specify your own value here.
+        """
+        self.log_dict(metrics={name: value}, step=step)
+
+    def log_dict(self, metrics: Mapping[str, Any], step: Optional[int] = None) -> None:
+        """Log multiple scalars at once to all loggers that were added to Fabric.
+
+        Args:
+            metrics: A dictionary where the key is the name of the metric and the value the scalar to be logged.
+                Any :class:`torch.Tensor` in the dictionary get detached from the graph automatically.
+            step: Optional step number. Most Logger implementations auto-increment this value by one with every
+                log call. You can specify your own value here.
+        """
+        metrics = convert_tensors_to_scalars(metrics)
+        for logger in self._loggers:
+            logger.log_metrics(metrics=metrics, step=step)
 
     @staticmethod
     def seed_everything(seed: Optional[int] = None, workers: Optional[bool] = None) -> int:
@@ -629,7 +703,7 @@ class Fabric:
 
     def _requires_distributed_sampler(self, dataloader: DataLoader) -> bool:
         return (
-            self._connector.is_distributed
+            getattr(self.strategy, "distributed_sampler_kwargs", None) is not None
             and not isinstance(dataloader.sampler, DistributedSampler)
             and not has_iterable_dataset(dataloader)
         )
@@ -669,15 +743,8 @@ class Fabric:
         if isinstance(module, _FabricModule):
             raise ValueError("A model should be passed only once to the `setup_module` method.")
 
-        if isinstance(self._strategy, DDPShardedStrategy):
-            raise RuntimeError(
-                f"The `{type(self._strategy).__name__}` requires the model and optimizer(s) to be set up jointly"
-                " through `.setup(model, optimizer, ...)`. For inference, choose a different strategy, for example"
-                " `ddp`."
-            )
-
     def _validate_setup_optimizers(self, optimizers: Sequence[Optimizer]) -> None:
-        if isinstance(self._strategy, (DeepSpeedStrategy, DDPShardedStrategy, XLAStrategy)):
+        if isinstance(self._strategy, (DeepSpeedStrategy, XLAStrategy)):
             raise RuntimeError(
                 f"The `{type(self._strategy).__name__}` requires the model and optimizer(s) to be set up jointly"
                 " through `.setup(model, optimizer, ...)`."

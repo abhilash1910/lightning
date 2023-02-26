@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,10 +48,6 @@ class SingleTPUStrategy(SingleDeviceStrategy):
     @checkpoint_io.setter
     def checkpoint_io(self, io: Optional[CheckpointIO]) -> None:
         self._checkpoint_io = io
-
-    @property
-    def is_distributed(self) -> bool:
-        return False
 
     @classmethod
     def register_strategies(cls, strategy_registry: Dict) -> None:

@@ -1,6 +1,18 @@
-from typing import Any, Callable, Type
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from typing_extensions import Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable, Type
 
 from lightning.app.components.multi_node.base import MultiNode
 from lightning.app.core.queues import MultiProcessQueue
@@ -34,7 +46,12 @@ class _PyTorchSpawnRunExecutor(WorkRunExecutor):
         import torch
 
         with self.enable_spawn():
-            nprocs = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            if torch.cuda.is_available():
+                nprocs = torch.cuda.device_count()
+            elif torch.xpu.is_available():
+                nprocs = torch.xpu.device_count()
+            else:
+                nprocs = 1
             queue = self.delta_queue if isinstance(self.delta_queue, MultiProcessQueue) else self.delta_queue.to_dict()
             torch.multiprocessing.spawn(
                 self.dispatch_run,
@@ -78,8 +95,14 @@ class _PyTorchSpawnRunExecutor(WorkRunExecutor):
 
         if torch.distributed.is_available():
             if not torch.distributed.is_initialized():
+                if torch.cuda.is_available():
+                    backend = "nccl"
+                elif torch.xpu.is_available():
+                    backend = "ccl"
+                else:
+                    backend = "gloo"
                 torch.distributed.init_process_group(
-                    "nccl" if torch.cuda.is_available() else "gloo",
+                    backend,
                     rank=global_rank,
                     world_size=world_size,
                     init_method=f"tcp://{main_address}:{main_port}",

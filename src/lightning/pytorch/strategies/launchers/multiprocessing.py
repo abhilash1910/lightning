@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 import os
 import tempfile
 from collections import UserList
+from contextlib import suppress
 from dataclasses import dataclass
 from multiprocessing.queues import SimpleQueue
-from typing import Any, Callable, Dict, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional
 
 import numpy as np
 import torch
@@ -24,17 +26,18 @@ import torch.backends.cudnn
 import torch.multiprocessing as mp
 from lightning_utilities.core.apply_func import apply_to_collection
 from torch import Tensor
-from typing_extensions import Literal
 
 import lightning.pytorch as pl
-from lightning.fabric.strategies.launchers.base import _Launcher
 from lightning.fabric.strategies.launchers.multiprocessing import _check_bad_cuda_fork
 from lightning.fabric.utilities import move_data_to_device
-from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_1_11
 from lightning.fabric.utilities.seed import _collect_rng_states, _set_rng_states
 from lightning.fabric.utilities.types import _PATH
+from lightning.pytorch.strategies.launchers.launcher import _Launcher
+from lightning.pytorch.trainer.connectors.signal_connector import _SIGNUM
 from lightning.pytorch.trainer.states import TrainerFn, TrainerState
 from lightning.pytorch.utilities.rank_zero import rank_zero_debug
+
+log = logging.getLogger(__name__)
 
 
 class _MultiProcessingLauncher(_Launcher):
@@ -70,6 +73,7 @@ class _MultiProcessingLauncher(_Launcher):
                 f"The start method '{self._start_method}' is not available on this platform. Available methods are:"
                 f" {', '.join(mp.get_all_start_methods())}"
             )
+        self.procs: List[mp.Process] = []
 
     @property
     def is_interactive_compatible(self) -> bool:
@@ -110,12 +114,17 @@ class _MultiProcessingLauncher(_Launcher):
         else:
             process_args = [trainer, function, args, kwargs, return_queue]
 
-        mp.start_processes(
+        process_context = mp.start_processes(
             self._wrapping_function,
             args=process_args,
             nprocs=self._strategy.num_processes,
             start_method=self._start_method,
+            join=False,  # we will join ourselves to get the process references
         )
+        self.procs = process_context.processes
+        while not process_context.join():
+            pass
+
         worker_output = return_queue.get()
         if trainer is None:
             return worker_output
@@ -153,7 +162,9 @@ class _MultiProcessingLauncher(_Launcher):
         # load last weights
         if worker_output.weights_path is not None:
             ckpt = self._strategy.checkpoint_io.load_checkpoint(worker_output.weights_path)
-            trainer.lightning_module.load_state_dict(ckpt)
+            # choose non-strict loading of parameters on the main process, because the model's composition
+            # could have changed in the worker process (layers added or removed)
+            trainer.lightning_module.load_state_dict(ckpt, strict=False)
             self._strategy.checkpoint_io.remove_checkpoint(worker_output.weights_path)
 
         trainer.state = worker_output.trainer_state
@@ -224,6 +235,18 @@ class _MultiProcessingLauncher(_Launcher):
         callback_metrics: dict = queue.get()
         trainer.callback_metrics.update(apply_to_collection(callback_metrics, np.ndarray, lambda x: torch.tensor(x)))
 
+    def kill(self, signum: _SIGNUM) -> None:
+        for proc in self.procs:
+            if proc.is_alive() and proc.pid is not None:
+                log.info(f"pid {os.getpid()} killing {proc.pid} with {signum}")
+                with suppress(ProcessLookupError):
+                    os.kill(proc.pid, signum)
+
+    def __getstate__(self) -> Dict:
+        state = self.__dict__.copy()
+        state["procs"] = []  # SpawnProcess can't be pickled
+        return state
+
 
 class _FakeQueue(UserList):
     """Simulates a :class:`torch.multiprocessing.queue.SimpleQueue` interface using the Python list."""
@@ -273,21 +296,17 @@ class _GlobalStateSnapshot:
     def capture(cls) -> "_GlobalStateSnapshot":
         """Capture a few global states from torch, numpy, etc., that we want to restore in a spawned worker
         process."""
-        warn_only = torch.is_deterministic_algorithms_warn_only_enabled() if _TORCH_GREATER_EQUAL_1_11 else False
         return cls(
             use_deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
-            use_deterministic_algorithms_warn_only=warn_only,
+            use_deterministic_algorithms_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
             cudnn_benchmark=torch.backends.cudnn.benchmark,
             rng_states=_collect_rng_states(),
         )
 
     def restore(self) -> None:
         """Restores all globals to the values captured in the :meth:`capture` method."""
-        if _TORCH_GREATER_EQUAL_1_11:
-            torch.use_deterministic_algorithms(
-                self.use_deterministic_algorithms, warn_only=self.use_deterministic_algorithms_warn_only
-            )
-        else:
-            torch.use_deterministic_algorithms(self.use_deterministic_algorithms)
+        torch.use_deterministic_algorithms(
+            self.use_deterministic_algorithms, warn_only=self.use_deterministic_algorithms_warn_only
+        )
         torch.backends.cudnn.benchmark = self.cudnn_benchmark
         _set_rng_states(self.rng_states)

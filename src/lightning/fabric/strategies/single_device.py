@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ class SingleDeviceStrategy(Strategy):
     def module_to_device(self, module: Module) -> None:
         module.to(self.root_device)
 
-    def reduce(self, tensor: Any | Tensor, *args: Any, **kwargs: Any) -> Any | Tensor:
+    def all_reduce(self, tensor: Any | Tensor, *args: Any, **kwargs: Any) -> Any | Tensor:
         """Reduces a tensor from several distributed processes to one aggregated tensor. As this plugin only
         operates with a single device, the reduction is simply the identity.
 

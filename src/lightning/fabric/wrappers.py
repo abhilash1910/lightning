@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 from typing import Any, Callable, Dict, Generator, Iterator, Mapping, Optional, overload, TypeVar, Union
 
 import torch
@@ -25,6 +26,7 @@ from lightning.fabric.plugins import Precision
 from lightning.fabric.plugins.precision.utils import _convert_fp_tensor
 from lightning.fabric.strategies import Strategy
 from lightning.fabric.utilities import move_data_to_device
+from lightning.fabric.utilities.data import _set_sampler_epoch
 from lightning.fabric.utilities.device_dtype_mixin import _DeviceDtypeModuleMixin
 from lightning.fabric.utilities.types import Optimizable
 
@@ -44,7 +46,9 @@ class _FabricOptimizer:
         """
         # `__del__` is skipped in case the optimizer has implemented custom destructor logic which we would
         # not want to call on destruction of the `_FabricOptimizer
-        self.__dict__ = {k: v for k, v in optimizer.__dict__.items() if k not in ("state_dict", "step", "__del__")}
+        self.__dict__ = {
+            k: v for k, v in optimizer.__dict__.items() if k not in ("state_dict", "step", "zero_grad", "__del__")
+        }
         self.__class__ = type("Fabric" + optimizer.__class__.__name__, (self.__class__, optimizer.__class__), {})
         self._optimizer = optimizer
         self._strategy = strategy
@@ -67,6 +71,10 @@ class _FabricOptimizer:
             optimizer,
             **kwargs,
         )
+
+    def zero_grad(self, **kwargs: Any) -> None:
+        kwargs = _process_optimizer_zero_grad_kwargs(self.optimizer, kwargs)
+        self.optimizer.zero_grad(**kwargs)
 
 
 class _FabricModule(_DeviceDtypeModuleMixin):
@@ -161,17 +169,36 @@ class _FabricDataLoader:
         return len(self._dataloader)
 
     def __iter__(self) -> Union[Iterator[Any], Generator[Any, None, None]]:
-        if hasattr(self._dataloader.sampler, "set_epoch"):
-            # Without setting the epoch, the distributed sampler would return the same indices every time, even when
-            # shuffling is enabled. In PyTorch, the user would normally have to call `.set_epoch()` on the sampler.
-            # In Lite, we take care of this boilerplate code.
-            self._dataloader.sampler.set_epoch(self._num_iter_calls)
+        # Without setting the epoch, the distributed sampler would return the same indices every time, even when
+        # shuffling is enabled. In PyTorch, the user would normally have to call `.set_epoch()` on the sampler.
+        # In Fabric, we take care of this boilerplate code.
+        _set_sampler_epoch(self._dataloader, self._num_iter_calls)
         self._num_iter_calls += 1
 
-        iterator = iter(self._dataloader)
         if self._device is None:
-            yield from iterator
-            return
+            yield from iter(self._dataloader)
+        else:
+            for item in self._dataloader:
+                yield move_data_to_device(item, self._device)
 
-        for item in iterator:
-            yield move_data_to_device(item, self._device)
+
+def _process_optimizer_zero_grad_kwargs(optimizer: Optimizer, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    if "set_to_none" in kwargs and "set_grads_to_None" in inspect.signature(optimizer.zero_grad).parameters:
+        # Some optimizers out there, for example DeepSpeedZeroOptimizer, use a different name than PyTorch
+        kwargs["set_grads_to_None"] = kwargs.pop("set_to_none")
+    return kwargs
+
+
+def _unwrap_objects(collection: Any) -> Any:
+    def _unwrap(
+        obj: Union[_FabricModule, _FabricOptimizer, _FabricDataLoader]
+    ) -> Union[nn.Module, Optimizer, DataLoader]:
+        if isinstance(obj, _FabricModule):
+            return obj._forward_module
+        if isinstance(obj, _FabricOptimizer):
+            return obj.optimizer
+        if isinstance(obj, _FabricDataLoader):
+            return obj._dataloader
+        return obj
+
+    return apply_to_collection(collection, dtype=(_FabricModule, _FabricOptimizer, _FabricDataLoader), function=_unwrap)

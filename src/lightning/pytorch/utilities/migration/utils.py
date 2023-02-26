@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -148,5 +148,6 @@ def _set_legacy_version(checkpoint: _CHECKPOINT, version: str) -> None:
 
 def _should_upgrade(checkpoint: _CHECKPOINT, target: str, max_version: Optional[str] = None) -> bool:
     """Returns whether a checkpoint qualifies for an upgrade when the version is lower than the given target."""
-    is_lte_max_version = max_version is None or Version(target) <= Version(max_version)
-    return Version(_get_version(checkpoint)) < Version(target) and is_lte_max_version
+    target_version = Version(target)
+    is_lte_max_version = max_version is None or target_version <= Version(max_version)
+    return is_lte_max_version and Version(_get_version(checkpoint)) < target_version

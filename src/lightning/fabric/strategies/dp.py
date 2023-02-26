@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,6 +50,10 @@ class DataParallelStrategy(ParallelStrategy):
         assert self.parallel_devices is not None
         return self.parallel_devices[0]
 
+    @property
+    def distributed_sampler_kwargs(self) -> None:
+        return None
+
     def setup_module(self, module: Module) -> DataParallel:
         """Wraps the given model into a :class:`~torch.nn.parallel.DataParallel` module."""
         return DataParallel(module=module, device_ids=self.parallel_devices)
@@ -61,7 +65,7 @@ class DataParallelStrategy(ParallelStrategy):
         # DataParallel handles the transfer of batch to the device
         return batch
 
-    def reduce(
+    def all_reduce(
         self, collection: TReduce, group: Optional[Any] = None, reduce_op: Optional[Union[ReduceOp, str]] = "mean"
     ) -> TReduce:
         def mean(t: Tensor) -> Tensor:
@@ -78,6 +82,11 @@ class DataParallelStrategy(ParallelStrategy):
 
     def reduce_boolean_decision(self, decision: bool, all: bool = True) -> bool:
         return decision
+
+    def get_module_state_dict(self, module: Module) -> Dict[str, Union[Any, Tensor]]:
+        if isinstance(module, DataParallel):
+            module = module.module
+        return super().get_module_state_dict(module)
 
     @classmethod
     def register_strategies(cls, strategy_registry: Dict) -> None:

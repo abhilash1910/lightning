@@ -1,5 +1,7 @@
 import logging
 import os
+import sys
+from contextlib import nullcontext
 from typing import Any, Iterable, Iterator, List, Optional, Sized, Tuple, Union
 
 import torch
@@ -9,8 +11,17 @@ from torch import Tensor
 from torch.utils.data import Dataset, DistributedSampler, Sampler
 
 from lightning.fabric.plugins.environments.cluster_environment import ClusterEnvironment
+from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_1_12
 from lightning.fabric.utilities.rank_zero import rank_zero_info
 from lightning.fabric.utilities.types import ReduceOp
+
+try:
+    import oneccl_bindings_for_pytorch as torch_ccl
+
+    rank_zero_info(f"Using Intel(R) oneCCL Bindings for PyTorch* {torch_ccl.__version__}")
+except ImportError:
+    rank_zero_info(f"Unable to initialize Intel(R) oneCCL Bindings for PyTorch")
+    pass
 
 if torch.distributed.is_available():
     from torch.distributed import group
@@ -164,21 +175,27 @@ class _AllGather(torch.autograd.Function):
         group: Optional["torch.distributed.ProcessGroup"] = group.WORLD,
     ) -> Tensor:
         ctx.group = group
-
-        gathered_tensor = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
-
+        gathered_tensor = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size(group=group))]
         torch.distributed.all_gather(gathered_tensor, tensor, group=group)
         gathered_tensor = torch.stack(gathered_tensor, dim=0)
-
         return gathered_tensor
 
     @staticmethod
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[Tensor, None]:
         grad_output = torch.cat(grad_output)
-
         torch.distributed.all_reduce(grad_output, op=torch.distributed.ReduceOp.SUM, async_op=False, group=ctx.group)
-
         return grad_output[torch.distributed.get_rank()], None
+
+
+def _functional_all_gather(tensor: Any, group: Any) -> Any:
+    """Compatibility layer with Windows."""
+    if sys.platform == "win32" and not _TORCH_GREATER_EQUAL_1_12:
+        # TODO: also remove `_AllGather` when support for 1.12 is dropped
+        return _AllGather.apply(tensor, group)
+
+    import torch.distributed.nn
+
+    return torch.distributed.nn.functional.all_gather(tensor, group)
 
 
 def _all_gather_ddp_if_available(
@@ -194,13 +211,12 @@ def _all_gather_ddp_if_available(
     Return:
         A tensor of shape (world_size, batch, ...)
     """
-    group = group if group is not None else torch.distributed.group.WORLD
-    if _distributed_available():
-        if sync_grads:
-            return _AllGather.apply(tensor, group)
-        with torch.no_grad():
-            return _AllGather.apply(tensor, group)
-    return tensor
+    if not _distributed_available():
+        return tensor
+    tensor = tensor.contiguous()  # https://github.com/pytorch/pytorch/issues/73515
+    with nullcontext() if sync_grads else torch.no_grad():
+        gathered_tensors = _functional_all_gather(tensor, group)
+    return torch.stack(gathered_tensors)
 
 
 def _init_dist_connection(
@@ -215,7 +231,7 @@ def _init_dist_connection(
 
     Args:
         cluster_environment: ``ClusterEnvironment`` instance
-        torch_distributed_backend: Backend to use (includes `nccl` and `gloo`)
+        torch_distributed_backend: Backend to use (includes `nccl`, `ccl` and `gloo`)
         global_rank: Rank of the current process
         world_size: Number of processes in the group
         kwargs: Kwargs for ``init_process_group``
@@ -246,15 +262,14 @@ def _init_dist_connection(
 
 
 def _get_default_process_group_backend_for_device(device: torch.device) -> str:
-    if device.type == "xpu":
-        return "ccl"
-    elif device.type == "cuda":
+    if device.type == "cuda":
         return "nccl"
+    elif device.type == "xpu":
+        return "ccl"
     else:
         return "gloo"
 
 
-# TODO(fabric): The error messages refer to 'replace_sampler_ddp' in PL but Fabric has it named 'replace_sampler'
 class _DatasetSamplerWrapper(Dataset):
     """Dataset to create indexes from `Sampler` or `Iterable`"""
 
@@ -263,19 +278,19 @@ class _DatasetSamplerWrapper(Dataset):
             raise TypeError(
                 "You seem to have configured a sampler in your DataLoader which"
                 " does not provide `__len__` method. The sampler was about to be"
-                " replaced by `DistributedSamplerWrapper` since `replace_sampler_ddp`"
+                " replaced by `DistributedSamplerWrapper` since `use_distributed_sampler`"
                 " is True and you are using distributed training. Either provide `__len__`"
-                " method in your sampler, remove it from DataLoader or set `replace_sampler_ddp=False`"
+                " method in your sampler, remove it from DataLoader or set `use_distributed_sampler=False`"
                 " if you want to handle distributed sampling yourself."
             )
         if len(sampler) == float("inf"):
             raise TypeError(
                 "You seem to have configured a sampler in your DataLoader which"
                 " does not provide finite `__len__` method. The sampler was about to be"
-                " replaced by `DistributedSamplerWrapper` since `replace_sampler_ddp`"
+                " replaced by `DistributedSamplerWrapper` since `use_distributed_sampler`"
                 " is True and you are using distributed training. Either provide `__len__`"
                 " method in your sampler which returns a finite number, remove it from DataLoader"
-                " or set `replace_sampler_ddp=False` if you want to handle distributed sampling yourself."
+                " or set `use_distributed_sampler=False` if you want to handle distributed sampling yourself."
             )
         self._sampler = sampler
         # defer materializing an iterator until it is necessary

@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,86 +11,53 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Callable, Optional, TYPE_CHECKING, Union
+from typing import Any, Callable, cast, Literal, Optional, TYPE_CHECKING, Union
 
-from lightning_utilities.core.imports import RequirementCache
 from torch import Tensor
 from torch.optim import LBFGS, Optimizer
+from typing_extensions import get_args
 
 import lightning.pytorch as pl
-from lightning.fabric.utilities.enums import PrecisionType
+from lightning.fabric.strategies.deepspeed import _DEEPSPEED_AVAILABLE
 from lightning.fabric.utilities.types import Steppable
-from lightning.pytorch.plugins.precision.apex_amp import _APEX_AVAILABLE
 from lightning.pytorch.plugins.precision.precision_plugin import PrecisionPlugin
 from lightning.pytorch.utilities import GradClipAlgorithmType
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.model_helpers import is_overridden
-from lightning.pytorch.utilities.rank_zero import rank_zero_deprecation, WarningCache
+from lightning.pytorch.utilities.rank_zero import WarningCache
 
-_DEEPSPEED_AVAILABLE = RequirementCache("deepspeed")
 if TYPE_CHECKING and _DEEPSPEED_AVAILABLE:
     import deepspeed
 
 warning_cache = WarningCache()
+
+_PRECISION_INPUT = Literal["32-true", "16-mixed", "bf16-mixed"]
 
 
 class DeepSpeedPrecisionPlugin(PrecisionPlugin):
     """Precision plugin for DeepSpeed integration.
 
     Args:
-        precision: Double precision (64), full precision (32), half precision (16) or bfloat16 precision (bf16).
+        precision: Full precision (32), half precision (16) or bfloat16 precision (bf16).
     Raises:
         ValueError:
             If unsupported ``precision`` is provided.
     """
 
-    def __init__(
-        self, precision: Union[str, int], amp_type: Optional[str] = None, amp_level: Optional[str] = None
-    ) -> None:
-        if amp_type == "apex":
-            # TODO: remove in v1.10.0
-            rank_zero_deprecation(
-                "The NVIDIA/apex AMP implementation has been deprecated upstream. Consequently, its integration inside"
-                " PyTorch Lightning has been deprecated in v1.9.0. Support for using it through the DeepSpeed"
-                " implementation will be removed in v1.10.0."
-            )
-            if not _APEX_AVAILABLE:
-                raise MisconfigurationException(
-                    "You have asked for Apex AMP but `apex` is not installed."
-                    " Install `apex` using this guide: https://github.com/NVIDIA/apex"
-                )
-
-            amp_level = amp_level or "O2"
-        elif amp_level is not None:
-            raise ValueError(
-                f"`{type(self).__name__}(amp_level={amp_level!r})` is only relevant when using NVIDIA/apex"
-            )
-        if amp_type is None:
-            amp_type = "native"
-        else:
-            rank_zero_deprecation(
-                f"Passing `{type(self).__name__}(amp_type={amp_type!r})` been deprecated in v1.9.0 and will be removed"
-                f" in v1.10.0. This argument is no longer necessary."
-            )
-
-        supported_precision = (PrecisionType.HALF, PrecisionType.FLOAT, PrecisionType.BFLOAT)
+    def __init__(self, precision: Literal["32-true", "16-mixed", "bf16-mixed"]) -> None:
+        supported_precision = get_args(_PRECISION_INPUT)
         if precision not in supported_precision:
             raise ValueError(
                 f"`Trainer(strategy='deepspeed', precision={precision!r})` is not supported."
-                f" `precision` must be one of: {(x.value for x in supported_precision)}."
+                f" `precision` must be one of: {supported_precision}."
             )
-
-        super().__init__()
-        self.precision = precision
-        self.amp_type = amp_type
-        self.amp_level = amp_level
+        self.precision = cast(_PRECISION_INPUT, str(precision))
 
     def backward(  # type: ignore[override]
         self,
         tensor: Tensor,
         model: "pl.LightningModule",
         optimizer: Optional[Steppable],
-        optimizer_idx: Optional[int],
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -100,7 +67,6 @@ class DeepSpeedPrecisionPlugin(PrecisionPlugin):
             tensor: the loss tensor
             model: the model to be optimized
             optimizer: ignored for DeepSpeed
-            optimizer_idx: ignored for DeepSpeed
             \*args: additional positional arguments for the :meth:`deepspeed.DeepSpeedEngine.backward` call
             \**kwargs: additional keyword arguments for the :meth:`deepspeed.DeepSpeedEngine.backward` call
         """
@@ -116,16 +82,13 @@ class DeepSpeedPrecisionPlugin(PrecisionPlugin):
         self,
         optimizer: Steppable,
         model: "pl.LightningModule",
-        optimizer_idx: int,
         closure: Callable[[], Any],
         **kwargs: Any,
     ) -> Any:
         if isinstance(optimizer, LBFGS):
-            raise MisconfigurationException(
-                f"DeepSpeed and the LBFGS optimizer are not compatible (optimizer {optimizer_idx})."
-            )
+            raise MisconfigurationException("DeepSpeed and the LBFGS optimizer are not compatible.")
         closure_result = closure()
-        self._after_closure(model, optimizer, optimizer_idx)
+        self._after_closure(model, optimizer)
         skipped_backward = closure_result is None
         # in manual optimization, the closure does not return a value
         if model.automatic_optimization and skipped_backward:
@@ -143,12 +106,3 @@ class DeepSpeedPrecisionPlugin(PrecisionPlugin):
         gradient_clip_algorithm: GradClipAlgorithmType = GradClipAlgorithmType.NORM,
     ) -> None:
         """DeepSpeed handles gradient clipping internally."""
-
-    def _track_grad_norm(self, trainer: "pl.Trainer") -> None:
-        if trainer.track_grad_norm == -1:
-            return
-        # the gradients are not available in the model due to gradient partitioning in zero stage >= 2
-        warning_cache.warn(
-            f"You set `Trainer(track_grad_norm={trainer.track_grad_norm!r})' but this is not supported for DeepSpeed."
-            " The setting will be ignored."
-        )

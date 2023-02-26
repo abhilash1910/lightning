@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,47 +11,47 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
 import torch
-from lightning_utilities.core.imports import RequirementCache
 from torch import Tensor
-from typing_extensions import Literal
+from typing_extensions import get_args
 
 from lightning.fabric.plugins.precision.precision import Precision
 from lightning.fabric.plugins.precision.utils import _convert_fp_tensor
-from lightning.fabric.utilities.enums import PrecisionType
 from lightning.fabric.utilities.types import Steppable
 
-_DEEPSPEED_AVAILABLE = RequirementCache("deepspeed")
-if TYPE_CHECKING and _DEEPSPEED_AVAILABLE:
-    import deepspeed
+if TYPE_CHECKING:
+    from lightning.fabric.strategies.deepspeed import _DEEPSPEED_AVAILABLE
+
+    if _DEEPSPEED_AVAILABLE:  # type: ignore[has-type]
+        import deepspeed
+
+_PRECISION_INPUT = Literal["32-true", "16-mixed", "bf16-mixed"]
 
 
 class DeepSpeedPrecision(Precision):
     """Precision plugin for DeepSpeed integration.
 
     Args:
-        precision: Full precision (32), half precision (16) or bfloat16 precision (bf16).
+        precision: Full precision (32-true), half precision (16-mixed) or bfloat16 precision (bf16-mixed).
 
     Raises:
         ValueError:
             If unsupported ``precision`` is provided.
     """
 
-    def __init__(self, precision: Literal[16, 32, "bf16"]) -> None:
-        supported_precision = (PrecisionType.HALF, PrecisionType.FLOAT, PrecisionType.BFLOAT)
+    def __init__(self, precision: _PRECISION_INPUT) -> None:
+        supported_precision = get_args(_PRECISION_INPUT)
         if precision not in supported_precision:
             raise ValueError(
                 f"`precision={precision!r})` is not supported in DeepSpeed."
-                f" `precision` must be one of: {(x.value for x in supported_precision)}."
+                f" `precision` must be one of: {supported_precision}."
             )
-
-        super().__init__()
         self.precision = precision
 
     def convert_input(self, data: Tensor) -> Tensor:
-        precision_to_type = {"bf16": torch.bfloat16, 16: torch.float16, 32: torch.float32}
+        precision_to_type = {"bf16-mixed": torch.bfloat16, "16-mixed": torch.float16, "32-true": torch.float32}
         dst_type = precision_to_type[self.precision]
         return _convert_fp_tensor(data, dst_type)
 

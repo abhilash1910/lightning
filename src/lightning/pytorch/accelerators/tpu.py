@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 
 from lightning.fabric.accelerators.tpu import _parse_tpu_devices, _XLA_AVAILABLE
-from lightning.fabric.accelerators.tpu import TPUAccelerator as LiteTPUAccelerator
+from lightning.fabric.accelerators.tpu import TPUAccelerator as FabricTPUAccelerator
 from lightning.fabric.utilities.types import _DEVICE
 from lightning.pytorch.accelerators.accelerator import Accelerator
 
@@ -74,7 +74,7 @@ class TPUAccelerator(Accelerator):
 
     @staticmethod
     def is_available() -> bool:
-        return LiteTPUAccelerator.is_available()
+        return FabricTPUAccelerator.is_available()
 
     @classmethod
     def register_accelerators(cls, accelerator_registry: Dict) -> None:

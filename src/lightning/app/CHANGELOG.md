@@ -4,17 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
-## [unreleased] - 202Y-MM-DD
+
+## [UnReleased] - 2023-MM-DD
 
 ### Added
 
-- Added a possibility to set up basic authentication for Lightning apps ([#16105](https://github.com/Lightning-AI/lightning/pull/16105))
+-
 
 
 ### Changed
 
-
-- The LoadBalancer now uses internal ip + port instead of URL exposed ([#16119](https://github.com/Lightning-AI/lightning/pull/16119))
+-
 
 
 ### Deprecated
@@ -24,12 +24,86 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Removed
 
+- Removed support for Python 3.7 ([#16579](https://github.com/Lightning-AI/lightning/pull/16579))
+
+- Removed implicit ui testing with `testing.run_app_in_cloud` in favor of headless login and app selection ([#16741](https://github.com/Lightning-AI/lightning/pull/16741))
+
+### Fixed
+
 -
 
+
+## [1.9.3] - 2023-02-21
+
+### Fixed
+
+- Fixed `lightning open` command and improved redirects ([#16794](https://github.com/Lightning-AI/lightning/pull/16794))
+
+
+## [1.9.2] - 2023-02-15
+
+- Added Storage Commands ([#16740](https://github.com/Lightning-AI/lightning/pull/16740))
+  * `rm`: Delete files from your Cloud Platform Filesystem
+- Added `lightning connect data` to register data connection to private s3 buckets ([#16738](https://github.com/Lightning-AI/lightning/pull/16738))
+
+
+## [1.9.1] - 2023-02-10
+
+### Added
+- Added `lightning open` command ([#16482](https://github.com/Lightning-AI/lightning/pull/16482))
+- Added experimental support for interruptible GPU in the cloud ([#16399](https://github.com/Lightning-AI/lightning/pull/16399))
+- Added FileSystem abstraction to simply manipulation of files ([#16581](https://github.com/Lightning-AI/lightning/pull/16581))
+- Added Storage Commands ([#16606](https://github.com/Lightning-AI/lightning/pull/16606))
+  * `ls`: List files from your Cloud Platform Filesystem
+  * `cd`: Change the current directory within your Cloud Platform filesystem (terminal session based)
+  * `pwd`: Return the current folder in your Cloud Platform Filesystem
+  * `cp`: Copy files between your Cloud Platform Filesystem and local filesystem
+- Prevent to `cd` into non existent folders ([#16645](https://github.com/Lightning-AI/lightning/pull/16645))
+- Enabled `cp` (upload) at project level ([#16631](https://github.com/Lightning-AI/lightning/pull/16631))
+- Enabled `ls` and `cp` (download) at project level ([#16622](https://github.com/Lightning-AI/lightning/pull/16622))
+- Added `lightning connect data` to register data connection to s3 buckets ([#16670](https://github.com/Lightning-AI/lightning/pull/16670))
+- Added support for running with multiprocessing in the cloud ([#16624](https://github.com/Lightning-AI/lightning/pull/16624))
+- Initial plugin server ([#16523](https://github.com/Lightning-AI/lightning/pull/16523))
+- Connect and Disconnect node ([#16700](https://github.com/Lightning-AI/lightning/pull/16700))
+
+### Changed
+
+- Changed the default `LightningClient(retry=False)` to `retry=True` ([#16382](https://github.com/Lightning-AI/lightning/pull/16382))
+- Add support for async predict method in PythonServer and remove torch context ([#16453](https://github.com/Lightning-AI/lightning/pull/16453))
+- Renamed `lightning.app.components.LiteMultiNode` to `lightning.app.components.FabricMultiNode` ([#16505](https://github.com/Lightning-AI/lightning/pull/16505))
+- Changed the command `lightning connect` to `lightning connect app` for consistency ([#16670](https://github.com/Lightning-AI/lightning/pull/16670))
+- Refactor cloud dispatch and update to new API ([#16456](https://github.com/Lightning-AI/lightning/pull/16456))
+- Updated app URLs to the latest format ([#16568](https://github.com/Lightning-AI/lightning/pull/16568))
+
+### Fixed
+
+- Fixed a deadlock causing apps not to exit properly when running locally ([#16623](https://github.com/Lightning-AI/lightning/pull/16623))
+- Fixed the Drive root_folder not parsed properly ([#16454](https://github.com/Lightning-AI/lightning/pull/16454))
+- Fixed malformed path when downloading files using `lightning cp` ([#16626](https://github.com/Lightning-AI/lightning/pull/16626))
+- Fixed app name in URL ([#16575](https://github.com/Lightning-AI/lightning/pull/16575))
+
+
+## [1.9.0] - 2023-01-17
+
+### Added
+
+- Added a possibility to set up basic authentication for Lightning apps ([#16105](https://github.com/Lightning-AI/lightning/pull/16105))
+
+### Changed
+
+- The LoadBalancer now uses internal ip + port instead of URL exposed ([#16119](https://github.com/Lightning-AI/lightning/pull/16119))
+- Added support for logging in different trainer stages with  `DeviceStatsMonitor` ([#16002](https://github.com/Lightning-AI/lightning/pull/16002))
+- Changed `lightning.app.components.serve.gradio` to  `lightning.app.components.serve.gradio_server` ([#16201](https://github.com/Lightning-AI/lightning/pull/16201))
+- Made cluster creation/deletion async by default ([#16185](https://github.com/Lightning-AI/lightning/pull/16185))
+- Expose `LightningFlow.stop` method to stop the flow similar to works ([##16378](https://github.com/Lightning-AI/lightning/pull/16378))
 
 ### Fixed
 
 - Fixed not being able to run multiple lightning apps locally due to port collision ([#15819](https://github.com/Lightning-AI/lightning/pull/15819))
+- Avoid `relpath` bug on Windows ([#16164](https://github.com/Lightning-AI/lightning/pull/16164))
+- Avoid using the deprecated `LooseVersion` ([#16162](https://github.com/Lightning-AI/lightning/pull/16162))
+- Porting fixes to autoscaler component ([#16249](https://github.com/Lightning-AI/lightning/pull/16249))
+- Fixed a bug where `lightning login` with env variables would not correctly save the credentials ([#16339](https://github.com/Lightning-AI/lightning/pull/16339))
 
 
 ## [1.8.6] - 2022-12-21

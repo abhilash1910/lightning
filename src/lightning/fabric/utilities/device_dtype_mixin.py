@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,6 +43,8 @@ class _DeviceDtypeModuleMixin(Module):
         # make this more explicit to always include the index
         if device.type == "cuda" and device.index is None:
             return torch.device(f"cuda:{torch.cuda.current_device()}")
+        if device.type == "xpu" and device.index is None:
+            return torch.device(f"xpu:{torch.xpu.current_device()}")
 
         return device
 
@@ -52,6 +54,25 @@ class _DeviceDtypeModuleMixin(Module):
         device, dtype = torch._C._nn._parse_to(*args, **kwargs)[:2]
         self.__update_properties(device=device, dtype=dtype)
         return super().to(*args, **kwargs)
+
+    def xpu(self, device: Optional[Union[torch.device, int]] = None) -> Self:  # type: ignore[valid-type]
+        """Moves all model parameters and buffers to the GPU. This also makes associated parameters and buffers
+        different objects. So it should be called before constructing optimizer if the module will live on GPU
+        while being optimized.
+
+        Arguments:
+            device: If specified, all parameters will be copied to that device. If `None`, the current XPU device
+                index will be used.
+
+        Returns:
+            Module: self
+        """
+        if device is None:
+            device = torch.device("xpu", torch.xpu.current_device())
+        elif isinstance(device, int):
+            device = torch.device("xpu", index=device)
+        self.__update_properties(device=device)
+        return super().xpu(device=device)
 
     def cuda(self, device: Optional[Union[torch.device, int]] = None) -> Self:  # type: ignore[valid-type]
         """Moves all model parameters and buffers to the GPU. This also makes associated parameters and buffers

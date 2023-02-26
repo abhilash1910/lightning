@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from lightning.fabric.plugins.precision.amp import MixedPrecision
 from lightning.fabric.plugins.precision.deepspeed import DeepSpeedPrecision
 from lightning.fabric.plugins.precision.double import DoublePrecision
 from lightning.fabric.plugins.precision.fsdp import FSDPPrecision
-from lightning.fabric.plugins.precision.native_amp import MixedPrecision
 from lightning.fabric.plugins.precision.precision import Precision
 from lightning.fabric.plugins.precision.tpu import TPUPrecision
 from lightning.fabric.plugins.precision.tpu_bf16 import TPUBf16Precision

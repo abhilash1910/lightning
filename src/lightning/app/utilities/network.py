@@ -1,3 +1,17 @@
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import socket
 import time
 from functools import wraps
@@ -13,18 +27,62 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError, ConnectTimeout, ReadTimeout
 from urllib3.util.retry import Retry
 
+from lightning.app.core import constants
 from lightning.app.utilities.app_helpers import Logger
 
 logger = Logger(__name__)
 
 
+# Global record to track ports that have been allocated in this session.
+_reserved_ports = set()
+
+
 def find_free_network_port() -> int:
     """Finds a free port on localhost."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("", 0))
-    port = s.getsockname()[1]
-    s.close()
+    if constants.LIGHTNING_CLOUDSPACE_HOST is not None:
+        return _find_free_network_port_cloudspace()
+
+    port = None
+
+    for _ in range(10):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        if port not in _reserved_ports:
+            break
+
+    if port in _reserved_ports:
+        # Prevent an infinite loop, if we tried 10 times and didn't get a free port then something is wrong
+        raise RuntimeError(
+            "Couldn't find a free port. Please open an issue at `https://github.com/Lightning-AI/lightning/issues`."
+        )
+
+    _reserved_ports.add(port)
     return port
+
+
+def _find_free_network_port_cloudspace():
+    """Finds a free port in the exposed range when running in a cloudspace."""
+    for port in range(
+        constants.APP_SERVER_PORT + 1,  # constants.APP_SERVER_PORT is reserved for the app server
+        constants.APP_SERVER_PORT + constants.LIGHTNING_CLOUDSPACE_EXPOSED_PORT_COUNT,
+    ):
+        if port in _reserved_ports:
+            continue
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("", port))
+            sock.close()
+            _reserved_ports.add(port)
+            return port
+        except OSError:
+            continue
+
+    # This error should never happen. An app using this many ports would probably fail on a single machine anyway.
+    raise RuntimeError(f"All {constants.LIGHTNING_CLOUDSPACE_EXPOSED_PORT_COUNT} ports are already in use.")
 
 
 _CONNECTION_RETRY_TOTAL = 2880
@@ -65,7 +123,7 @@ def _get_next_backoff_time(num_retries: int, backoff_value: float = 0.5) -> floa
     return min(_DEFAULT_BACKOFF_MAX, next_backoff_value)
 
 
-def _retry_wrapper(func: Callable) -> Callable:
+def _retry_wrapper(self, func: Callable) -> Callable:
     """Returns the function decorated by a wrapper that retries the call several times if a connection error
     occurs.
 
@@ -77,7 +135,7 @@ def _retry_wrapper(func: Callable) -> Callable:
         consecutive_errors = 0
         while _get_next_backoff_time(consecutive_errors) != _DEFAULT_BACKOFF_MAX:
             try:
-                return func(*args, **kwargs)
+                return func(self, *args, **kwargs)
             except lightning_cloud.openapi.rest.ApiException as e:
                 # retry if the control plane fails with all errors except 4xx but not 408 - (Request Timeout)
                 if e.status == 408 or e.status == 409 or not str(e.status).startswith("4"):
@@ -113,17 +171,13 @@ class LightningClient(GridRestClient):
         retry: Whether API calls should follow a retry mechanism with exponential backoff.
     """
 
-    def __new__(cls, *args: Any, **kwargs: Any) -> "LightningClient":
-        if kwargs.get("retry", False):
+    def __init__(self, retry: bool = True) -> None:
+        super().__init__(api_client=create_swagger_client())
+        if retry:
             for base_class in GridRestClient.__mro__:
                 for name, attribute in base_class.__dict__.items():
                     if callable(attribute) and attribute.__name__ != "__init__":
-                        setattr(cls, name, _retry_wrapper(attribute))
-        return super().__new__(cls)
-
-    def __init__(self, retry: bool = False) -> None:
-        super().__init__(api_client=create_swagger_client())
-        self._retry = retry
+                        setattr(self, name, _retry_wrapper(self, attribute))
 
 
 class CustomRetryAdapter(HTTPAdapter):
@@ -154,6 +208,10 @@ def _http_method_logger_wrapper(func: Callable) -> Callable:
     return wrapped
 
 
+def _response(r, *args, **kwargs):
+    return r.raise_for_status()
+
+
 class HTTPClient:
     """A wrapper class around the requests library which handles chores like logging, retries, and timeouts
     automatically."""
@@ -180,7 +238,7 @@ class HTTPClient:
         adapter = CustomRetryAdapter(max_retries=retry_strategy, timeout=_DEFAULT_REQUEST_TIMEOUT)
         self.session = requests.Session()
 
-        self.session.hooks = {"response": lambda r, *args, **kwargs: r.raise_for_status()}
+        self.session.hooks = {"response": _response}
 
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)

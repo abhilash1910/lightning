@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Callable, Union
+from typing import Any, Callable, cast, Literal, Union
 
 from torch import Tensor
 from torch.optim import LBFGS, Optimizer
+from typing_extensions import get_args
 
 import lightning.pytorch as pl
-from lightning.fabric.utilities.enums import PrecisionType
 from lightning.fabric.utilities.types import Optimizable
 from lightning.pytorch.plugins.precision.precision_plugin import PrecisionPlugin
 from lightning.pytorch.utilities import GradClipAlgorithmType
@@ -27,24 +27,25 @@ from lightning.pytorch.utilities.rank_zero import WarningCache
 
 warning_cache = WarningCache()
 
+_PRECISION_INPUT = Literal["32-true", "16-mixed"]
+
 
 class IPUPrecisionPlugin(PrecisionPlugin):
     """Precision plugin for IPU integration.
 
     Raises:
         ValueError:
-            If the precision is neither 16 nor 32.
+            If the precision is neither 16-mixed nor 32-true.
     """
 
-    def __init__(self, precision: int) -> None:
-        supported_precision_values = (PrecisionType.HALF, PrecisionType.FLOAT)
-        if precision not in supported_precision_values:
+    def __init__(self, precision: Literal["32-true", "16-mixed"]) -> None:
+        supported_precision = get_args(_PRECISION_INPUT)
+        if precision not in supported_precision:
             raise ValueError(
                 f"`Trainer(accelerator='ipu', precision={precision!r})` is not supported."
-                f" `precision` must be one of: {supported_precision_values}."
+                f" `precision` must be one of: {supported_precision}."
             )
-        super().__init__()
-        self.precision = precision
+        self.precision = cast(_PRECISION_INPUT, str(precision))
 
     def backward(  # type: ignore[override]
         self,
@@ -63,17 +64,14 @@ class IPUPrecisionPlugin(PrecisionPlugin):
         self,
         optimizer: Optimizable,
         model: "pl.LightningModule",
-        optimizer_idx: int,
         closure: Callable[[], Any],
         **kwargs: Any,
     ) -> Any:
         """IPUs handle the optimizer step internally."""
         if isinstance(optimizer, LBFGS):
-            raise MisconfigurationException(
-                f"IPUs and the LBFGS optimizer are not compatible (optimizer {optimizer_idx})."
-            )
+            raise MisconfigurationException("IPUs and the LBFGS optimizer are not compatible.")
         closure_result = closure()
-        self._after_closure(model, optimizer, optimizer_idx)
+        self._after_closure(model, optimizer)
         skipped_backward = closure_result is None
         # in manual optimization, the closure does not return a value
         if model.automatic_optimization and skipped_backward:

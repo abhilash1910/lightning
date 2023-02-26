@@ -1,3 +1,17 @@
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import datetime
 import json
@@ -16,13 +30,14 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Type
 import requests
 from lightning_cloud.openapi import V1LightningappInstanceState
 from lightning_cloud.openapi.rest import ApiException
+from lightning_utilities.core.imports import package_available
 from requests import Session
 from rich import print
 from rich.color import ANSI_COLOR_NAMES
 
 from lightning.app import LightningApp, LightningFlow
 from lightning.app.cli.lightning_cli import run_app
-from lightning.app.core.constants import LIGHTNING_CLOUD_PROJECT_ID
+from lightning.app.core import constants
 from lightning.app.runners.multiprocess import MultiProcessRuntime
 from lightning.app.testing.config import _Config
 from lightning.app.utilities.app_logs import _app_logs_reader
@@ -36,7 +51,6 @@ from lightning.app.utilities.packaging.lightning_utils import get_dist_path_if_e
 from lightning.app.utilities.proxies import ProxyWorkRun
 
 if _is_playwright_available():
-    import playwright
     from playwright.sync_api import HttpCredentials, sync_playwright
 
 
@@ -131,18 +145,14 @@ class LightningTestApp(LightningApp):
 
 
 @requires("click")
-def application_testing(
-    lightning_app_cls: Type[LightningTestApp] = LightningTestApp, command_line: List[str] = []
-) -> Any:
+def application_testing(lit_app_cls: Type[LightningTestApp] = LightningTestApp, command_line: List[str] = []) -> Any:
     from unittest import mock
 
     from click.testing import CliRunner
 
-    patch1 = mock.patch("lightning.app.LightningApp", lightning_app_cls)
+    patch1 = mock.patch("lightning.app.LightningApp", lit_app_cls)
     # we need to patch both only with the mirror package
-    patch2 = (
-        mock.patch("lightning.LightningApp", lightning_app_cls) if "lightning.app" in sys.modules else nullcontext()
-    )
+    patch2 = mock.patch("lightning.LightningApp", lit_app_cls) if package_available("lightning") else nullcontext()
     with patch1, patch2:
         original = sys.argv
         sys.argv = command_line
@@ -161,7 +171,7 @@ class _SingleWorkFlow(LightningFlow):
 
     def run(self):
         if self.work.has_succeeded or self.work.has_failed:
-            self._exit()
+            self.stop()
         self.work.run(*self.args, **self.kwargs)
 
 
@@ -219,7 +229,7 @@ def _fetch_app_by_name(client, project_id, name):
     lit_apps = [
         app
         for app in client.lightningapp_instance_service_list_lightningapp_instances(project_id=project_id).lightningapps
-        if app.name == name
+        if app.name == name or getattr(app, "display_name", None) == name
     ]
     if not len(lit_apps) == 1:
         raise ValueError(f"Expected to find just one app, found {len(lit_apps)}")
@@ -234,8 +244,8 @@ def run_app_in_cloud(
 ) -> Generator:
     """This utility is used to automate testing e2e application with lightning.ai."""
     # 1. Validate the provide app_folder is correct.
-    if not os.path.exists(os.path.join(app_folder, "app.py")):
-        raise Exception("The app folder should contain an app.py file.")
+    if not os.path.exists(os.path.join(app_folder, app_name)):
+        raise Exception(f"The app folder should contain an {app_name} file.")
     if app_folder.endswith("/"):
         app_folder = app_folder[:-1]
 
@@ -261,14 +271,17 @@ def run_app_in_cloud(
     if url.endswith("/"):
         url = url[:-1]
     payload = {"apiKey": _Config.api_key, "username": _Config.username}
-    res = requests.post(url + "/v1/auth/login", data=json.dumps(payload))
+    url_login = url + "/v1/auth/login"
+    res = requests.post(url_login, data=json.dumps(payload))
     if "token" not in res.json():
-        raise Exception("You haven't properly setup your environment variables.")
+        raise RuntimeError(
+            f"You haven't properly setup your environment variables with {url_login} and data: \n{payload}"
+        )
 
     token = res.json()["token"]
 
     # 3. Disconnect from the App if any.
-    Popen("lightning disconnect", shell=True).wait()
+    Popen("lightning logout", shell=True).wait()
 
     # 4. Launch the application in the cloud from the Lightning CLI.
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -298,6 +311,14 @@ def run_app_in_cloud(
             process = Popen((cmd + extra_args), cwd=tmpdir, env=env_copy, stdout=stdout, stderr=sys.stderr)
             process.wait()
 
+        # Fallback URL to prevent failures in case we don't get the admin URL
+        admin_url = _Config.url
+        with open(stdout_path) as fo:
+            for line in fo.readlines():
+                if line.startswith("APP_LOGS_URL: "):
+                    admin_url = line.replace("APP_LOGS_URL: ", "")
+                    break
+
         if is_editable_mode:
             # Added to ensure the current code is properly uploaded.
             # Otherwise, it could result in un-tested PRs.
@@ -324,59 +345,6 @@ def run_app_in_cloud(
             record_video_dir=os.path.join(_Config.video_location, TEST_APP_NAME),
             record_har_path=_Config.har_location,
         )
-        admin_page = context.new_page()
-        print(f"The Lightning App Token is: {token}")
-        print(f"The Lightning App user key is: {_Config.key}")
-        print(f"The Lightning App user id is: {_Config.id}")
-        admin_page.goto(_Config.url)
-        admin_page.evaluate(
-            """data => {
-            window.localStorage.setItem('gridUserId', data[0]);
-            window.localStorage.setItem('gridUserKey', data[1]);
-            window.localStorage.setItem('gridUserToken', data[2]);
-        }
-        """,
-            [_Config.id, _Config.key, token],
-        )
-        if LIGHTNING_CLOUD_PROJECT_ID:
-            admin_page.evaluate(
-                """data => {
-                window.localStorage.setItem('gridDefaultProjectIdOverride', JSON.stringify(data[0]));
-            }
-            """,
-                [LIGHTNING_CLOUD_PROJECT_ID],
-            )
-        admin_page.goto(f"{_Config.url}/{_Config.username}/apps", timeout=60 * 1000)
-
-        # Closing the Complete your profile dialog
-        try:
-            dialog = admin_page.locator("text=Complete your profile")
-            dialog.wait_for(timeout=10 * 1000, state="visible")
-            print("'Complete your profile' dialog visible, closing it.")
-            admin_page.locator('input[name="firstName"]').fill("first")
-            admin_page.locator('input[name="lastName"]').fill("last")
-            admin_page.locator('input[name="email"]').fill("e2e.test.admin@lightning.ai")
-            admin_page.locator('input[name="organization"]').fill("Lightning AI")
-            button = admin_page.locator('button:has-text("Confirm")')
-            button.wait_for(timeout=3 * 1000)
-            button.click()
-        except playwright._impl._api_types.TimeoutError:
-            print("'Complete your profile' dialog not visible, skipping.")
-
-        # Closing the Create Project dialog.
-        try:
-            project_dialog = admin_page.locator("text=Create a project")
-            project_dialog.wait_for(timeout=10 * 1000, state="visible")
-            print("'Create Project' dialog visible, closing it.")
-            project_name_input = admin_page.locator('input[type="text"]')
-            project_name_input.fill("Default Project")
-            button = admin_page.locator('button:has-text("Continue")')
-            button.wait_for(timeout=3 * 1000)
-            button.click()
-        except playwright._impl._api_types.TimeoutError:
-            print("'Create Project' dialog not visible, skipping.")
-
-        admin_page.locator(f'[data-cy="{name}"]').click()
 
         client = LightningClient()
         project_id = _get_project(client).project_id
@@ -389,33 +357,47 @@ def run_app_in_cloud(
             process = Process(target=_print_logs, kwargs={"app_id": app_id})
             process.start()
 
-        def wait_openapi(page: playwright.sync_api.Page, app_url: str) -> None:
-            page.goto(f"{app_url}/view")
-            j = 1
-            status_code = None
-            while status_code != 200:
-                status_code = requests.get(f"{app_url}/openapi.json").status_code
-                if debug and j % 30 == 0:
-                    print(f"Received status code {status_code} at {app_url!r}, continuing infinite loop...")
-                j += 1
-                sleep(1)
+        admin_page = context.new_page()
+        admin_page.goto(admin_url)
+        admin_page.evaluate(
+            """data => {
+            window.localStorage.setItem('gridUserId', data[0]);
+            window.localStorage.setItem('gridUserKey', data[1]);
+            window.localStorage.setItem('gridUserToken', data[2]);
+        }
+        """,
+            [_Config.id, _Config.key, token],
+        )
+        if constants.LIGHTNING_CLOUD_PROJECT_ID:
+            admin_page.evaluate(
+                """data => {
+                window.localStorage.setItem('gridDefaultProjectIdOverride', JSON.stringify(data[0]));
+            }
+            """,
+                [constants.LIGHTNING_CLOUD_PROJECT_ID],
+            )
 
         view_page = context.new_page()
         i = 1
         while True:
             app = _fetch_app_by_name(client, project_id, name)
-            # wait until the app is running
+            msg = f"Still in phase {app.status.phase}"
+
+            # wait until the app is running and openapi.json is ready
             if app.status.phase == V1LightningappInstanceState.RUNNING:
-                print("App is running, continuing with testing...")
-                wait_openapi(view_page, app.status.url)
-                break
-            elif app.status.phase != V1LightningappInstanceState.PENDING:
+                view_page.goto(f"{app.status.url}/view")
+                status_code = requests.get(f"{app.status.url}/openapi.json").status_code
+                if status_code == 200:
+                    print("App is running, continuing with testing...")
+                    break
+                msg = f"Received status code {status_code} at {app.status.url!r}"
+            elif app.status.phase not in (V1LightningappInstanceState.PENDING, V1LightningappInstanceState.NOT_STARTED):
                 # there's a race condition if the app goes from pending to running to something else before we evaluate
                 # the condition above. avoid it by checking stopped explicitly
                 print(f"App finished with phase {app.status.phase}, finished testing...")
                 break
             if debug and i % 30 == 0:
-                print(f"Still in phase {app.status.phase}, continuing infinite loop...")
+                print(f"{msg}, continuing infinite loop...")
             i += 1
             sleep(1)
 
@@ -473,13 +455,13 @@ def wait_for(page, callback: Callable, *args, **kwargs) -> Any:
             res = callback(*args, **kwargs)
             if res:
                 return res
-        except (playwright._impl._api_types.Error, playwright._impl._api_types.TimeoutError) as e:
-            print(e)
+        except (playwright._impl._api_types.Error, playwright._impl._api_types.TimeoutError) as err:
+            print(err)
             try:
                 sleep(7)
                 page.reload()
-            except (playwright._impl._api_types.Error, playwright._impl._api_types.TimeoutError) as e:
-                print(e)
+            except (playwright._impl._api_types.Error, playwright._impl._api_types.TimeoutError) as err:
+                print(err)
                 pass
             sleep(3)
 

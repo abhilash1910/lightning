@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,10 +18,11 @@ import os
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, Callable, Dict, Generator, Iterable, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, Generator, Iterable, Optional, Sized, Tuple, Type, Union
 
 from lightning_utilities.core.inheritance import get_all_subclasses
-from torch.utils.data import BatchSampler, DataLoader, Dataset, IterableDataset, Sampler
+from torch.utils.data import BatchSampler, DataLoader, IterableDataset, Sampler
+from typing_extensions import TypeGuard
 
 from lightning.fabric.utilities.enums import LightningEnum
 from lightning.fabric.utilities.exceptions import MisconfigurationException
@@ -42,31 +43,35 @@ class _WrapAttrTag(LightningEnum):
         return fn(*args)
 
 
-def has_iterable_dataset(dataloader: DataLoader) -> bool:
+def has_iterable_dataset(dataloader: object) -> bool:
     return hasattr(dataloader, "dataset") and isinstance(dataloader.dataset, IterableDataset)
 
 
-def has_len(dataloader: Union[DataLoader, Iterable, Dataset]) -> bool:
-    """Checks if a given Dataloader has ``__len__`` method implemented i.e. if it is a finite dataloader or
-    infinite dataloader."""
+def sized_len(dataloader: object) -> Optional[int]:
+    """Try to get the length of an object, return ``None`` otherwise."""
     try:
         # try getting the length
-        if len(dataloader) == 0:  # type: ignore [arg-type]
-            rank_zero_warn(
-                f"`{dataloader.__class__.__name__}` returned 0 length. Please make sure this was your intention."
-            )
-        has_len = True
+        length = len(dataloader)  # type: ignore [arg-type]
     except (TypeError, NotImplementedError):
-        has_len = False
+        length = None
+    return length
 
-    if has_len and isinstance(dataloader, DataLoader) and has_iterable_dataset(dataloader):
+
+def has_len(dataloader: object) -> TypeGuard[Sized]:
+    """Checks if a given object has ``__len__`` method implemented."""
+    length = sized_len(dataloader)
+    if length == 0:
+        rank_zero_warn(
+            f"`{dataloader.__class__.__name__}` returned 0 length. Please make sure this was your intention."
+        )
+    if length is not None and has_iterable_dataset(dataloader):
         rank_zero_warn(
             "Your `IterableDataset` has `__len__` defined."
             " In combination with multi-process data loading (when num_workers > 1),"
             " `__len__` could be inaccurate if each worker is not configured independently"
             " to avoid having duplicate data."
         )
-    return has_len
+    return length is not None
 
 
 def _update_dataloader(dataloader: DataLoader, sampler: Union[Sampler, Iterable]) -> DataLoader:
@@ -243,7 +248,9 @@ def _dataloader_init_kwargs_resolve_sampler(
     return {"sampler": sampler, "shuffle": False, "batch_sampler": None}
 
 
-def _auto_add_worker_init_fn(dataloader: DataLoader, rank: int) -> None:
+def _auto_add_worker_init_fn(dataloader: object, rank: int) -> None:
+    if not hasattr(dataloader, "worker_init_fn"):
+        return
     if int(os.environ.get("PL_SEED_WORKERS", 0)) and dataloader.worker_init_fn is None:
         dataloader.worker_init_fn = partial(pl_worker_init_function, rank=rank)
 
@@ -407,3 +414,25 @@ def _replace_value_in_saved_args(
         return True, args, kwargs
 
     return False, args, kwargs
+
+
+def _set_sampler_epoch(dataloader: Iterable, epoch: int) -> None:
+    """Calls the ``set_epoch`` method on either the sampler of the given dataloader.
+
+    Every PyTorch dataloader has either a sampler or a batch sampler. If the sampler is wrapped by a
+    :class:`~torch.utils.data.distributed.DistributedSampler`, ``set_epoch`` must be called at the beginning
+    of every epoch to ensure shuffling applies a new ordering. This has no effect if shuffling is off.
+    """
+    objects = set()
+    # check dataloader.sampler
+    if (sampler := getattr(dataloader, "sampler", None)) is not None:
+        objects.add(sampler)
+    # check dataloader.batch_sampler.sampler
+    if (batch_sampler := getattr(dataloader, "batch_sampler", None)) is not None and (
+        sampler := getattr(batch_sampler, "sampler", None)
+    ) is not None:
+        objects.add(sampler)
+    for obj in objects:
+        set_epoch = getattr(obj, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)

@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,14 +14,18 @@
 from typing import Any, Iterable, Optional, Union
 
 from lightning_utilities.core.apply_func import apply_to_collection
+from lightning_utilities.core.rank_zero import WarningCache
 from torch import Tensor
 
 import lightning.pytorch as pl
+from lightning.fabric.loggers.tensorboard import _TENSORBOARD_AVAILABLE, _TENSORBOARDX_AVAILABLE
 from lightning.fabric.plugins.environments import SLURMEnvironment
 from lightning.fabric.utilities import move_data_to_device
-from lightning.pytorch.loggers import Logger, TensorBoardLogger
+from lightning.fabric.utilities.apply_func import convert_tensors_to_scalars
+from lightning.pytorch.loggers import CSVLogger, Logger, TensorBoardLogger
 from lightning.pytorch.trainer.connectors.logger_connector.result import _METRICS, _OUT_DICT, _PBAR_DICT
-from lightning.pytorch.utilities.metrics import metrics_to_scalars
+
+warning_cache = WarningCache()
 
 
 class LoggerConnector:
@@ -33,23 +37,23 @@ class LoggerConnector:
         self._epoch_end_reached = False
         self._current_fx: Optional[str] = None
         self._batch_idx: Optional[int] = None
-        self._split_idx: Optional[int] = None
 
     def on_trainer_init(
         self,
         logger: Union[bool, Logger, Iterable[Logger]],
         log_every_n_steps: int,
-        move_metrics_to_cpu: bool,
     ) -> None:
         self.configure_logger(logger)
         self.trainer.log_every_n_steps = log_every_n_steps
-        self.trainer.move_metrics_to_cpu = move_metrics_to_cpu
 
     @property
     def should_update_logs(self) -> bool:
+        trainer = self.trainer
+        if trainer.log_every_n_steps == 0:
+            return False
         # `+ 1` because it can be checked before a step is executed, for example, in `on_train_batch_start`
-        should_log = (self.trainer.fit_loop.epoch_loop._batches_that_stepped + 1) % self.trainer.log_every_n_steps == 0
-        return should_log or self.trainer.should_stop
+        should_log = (trainer.fit_loop.epoch_loop._batches_that_stepped + 1) % trainer.log_every_n_steps == 0
+        return should_log or trainer.should_stop
 
     def configure_logger(self, logger: Union[bool, Logger, Iterable[Logger]]) -> None:
         if not logger:
@@ -57,9 +61,18 @@ class LoggerConnector:
             self.trainer.loggers = []
         elif logger is True:
             # default logger
-            self.trainer.loggers = [
-                TensorBoardLogger(save_dir=self.trainer.default_root_dir, version=SLURMEnvironment.job_id())
-            ]
+            if _TENSORBOARD_AVAILABLE or _TENSORBOARDX_AVAILABLE:
+                logger_ = TensorBoardLogger(save_dir=self.trainer.default_root_dir, version=SLURMEnvironment.job_id())
+            else:
+                warning_cache.warn(
+                    "Starting from v1.9.0, `tensorboardX` has been removed as a dependency of the `lightning.pytorch`"
+                    " package, due to potential conflicts with other packages in the ML ecosystem. For this reason,"
+                    " `logger=True` will use `CSVLogger` as the default logger, unless the `tensorboard`"
+                    " or `tensorboardX` packages are found."
+                    " Please `pip install lightning[extra]` or one of them to enable TensorBoard support by default"
+                )
+                logger_ = CSVLogger(save_dir=self.trainer.default_root_dir)  # type: ignore[assignment]
+            self.trainer.loggers = [logger_]
         elif isinstance(logger, Iterable):
             self.trainer.loggers = list(logger)
         else:
@@ -80,7 +93,7 @@ class LoggerConnector:
         self._logged_metrics.update(metrics)
 
         # turn all tensors to scalars
-        scalar_metrics = metrics_to_scalars(metrics)
+        scalar_metrics = convert_tensors_to_scalars(metrics)
 
         if step is None:
             step = scalar_metrics.pop("step", None)
@@ -131,9 +144,6 @@ class LoggerConnector:
     Train metric updates
     """
 
-    def on_train_split_start(self, split_idx: int) -> None:
-        self._split_idx = split_idx
-
     def update_train_step_metrics(self) -> None:
         if self.trainer.fit_loop._should_accumulate() and self.trainer.lightning_module.automatic_optimization:
             return
@@ -172,7 +182,6 @@ class LoggerConnector:
     def epoch_end_reached(self) -> None:
         self._epoch_end_reached = True
         self._batch_idx = None
-        self._split_idx = None
 
     def on_epoch_end(self) -> None:
         assert self._epoch_end_reached
@@ -196,10 +205,7 @@ class LoggerConnector:
 
     def should_reset_tensors(self, fx: str) -> bool:
         is_different_fx = self._current_fx != fx
-        if self._split_idx is None:
-            is_first_batch = self._batch_idx in (None, 0)
-        else:
-            is_first_batch = bool(self._batch_idx) + self._split_idx == 0
+        is_first_batch = self._batch_idx in (None, 0)
         return is_different_fx and is_first_batch
 
     def reset_metrics(self) -> None:
@@ -213,7 +219,6 @@ class LoggerConnector:
             results.reset()
 
         self._batch_idx = None
-        self._split_idx = None
         self._current_fx = None
 
     @property

@@ -23,8 +23,10 @@ from lightning.pytorch.accelerators import (
     IPUAccelerator,
     MPSAccelerator,
     TPUAccelerator,
+    XPUAccelerator,
 )
-from lightning.pytorch.accelerators.xpu import XPUAccelerator
+from lightning.pytorch.accelerators.hpu import _HPU_AVAILABLE
+from lightning.pytorch.accelerators.ipu import _IPU_AVAILABLE
 from lightning.pytorch.loggers.logger import DummyLogger
 from lightning.pytorch.profilers import (
     AdvancedProfiler,
@@ -34,7 +36,6 @@ from lightning.pytorch.profilers import (
     SimpleProfiler,
     XLAProfiler,
 )
-from lightning.pytorch.utilities import _HPU_AVAILABLE, _IPU_AVAILABLE
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.rank_zero import rank_zero_info, rank_zero_warn
 
@@ -72,7 +73,7 @@ def _init_debugging_flags(
 
         trainer.limit_test_batches = num_batches
         trainer.limit_predict_batches = num_batches
-        trainer.fit_loop.max_steps = num_batches
+        trainer.fit_loop.epoch_loop.max_steps = num_batches
         trainer.num_sanity_val_steps = 0
         trainer.fit_loop.max_epochs = 1
         trainer.val_check_interval = 1.0
@@ -149,23 +150,20 @@ def _init_profiler(trainer: "pl.Trainer", profiler: Optional[Union[Profiler, str
 
 
 def _log_device_info(trainer: "pl.Trainer") -> None:
-    if XPUAccelerator.is_available():
-        xpu_available = True
-        xpu_type = " (xpu)"
-    elif CUDAAccelerator.is_available():
+    if CUDAAccelerator.is_available():
         gpu_available = True
         gpu_type = " (cuda)"
     elif MPSAccelerator.is_available():
         gpu_available = True
         gpu_type = " (mps)"
+    elif XPUAccelerator.is_available():
+        gpu_available = True
+        gpu_type = " (xpu)"
     else:
         gpu_available = False
         gpu_type = ""
 
-    xpu_used = isinstance(trainer.accelerator, XPUAccelerator)
-    rank_zero_info(f"XPU available: {xpu_available}{xpu_type}, used: {xpu_used}")
-
-    gpu_used = isinstance(trainer.accelerator, (CUDAAccelerator, MPSAccelerator))
+    gpu_used = isinstance(trainer.accelerator, (XPUAccelerator, CUDAAccelerator, MPSAccelerator))
     rank_zero_info(f"GPU available: {gpu_available}{gpu_type}, used: {gpu_used}")
 
     num_tpu_cores = trainer.num_devices if isinstance(trainer.accelerator, TPUAccelerator) else 0
@@ -178,19 +176,17 @@ def _log_device_info(trainer: "pl.Trainer") -> None:
     rank_zero_info(f"HPU available: {_HPU_AVAILABLE}, using: {num_hpus} HPUs")
 
     # TODO: Integrate MPS Accelerator here, once gpu maps to both
-    
-    if XPUAccelerator.is_available() and not isinstance(self.accelerator, XPUAccelerator):
-        rank_zero_warn(
-            "XPU available but not used. Set `accelerator` and `devices` using"
-                f" `Trainer(accelerator='xpu', devices={XPUAccelerator.auto_device_count()})`.",
-                category=PossibleUserWarning,
-        )
-    
-    
     if CUDAAccelerator.is_available() and not isinstance(trainer.accelerator, CUDAAccelerator):
         rank_zero_warn(
             "GPU available but not used. Set `accelerator` and `devices` using"
             f" `Trainer(accelerator='gpu', devices={CUDAAccelerator.auto_device_count()})`.",
+            category=PossibleUserWarning,
+        )
+
+    if XPUAccelerator.is_available() and not isinstance(trainer.accelerator, XPUAccelerator):
+        rank_zero_warn(
+            "GPU available but not used. Set `accelerator` and `devices` using"
+            f" `Trainer(accelerator='gpu', devices={XPUAccelerator.auto_device_count()})`.",
             category=PossibleUserWarning,
         )
 

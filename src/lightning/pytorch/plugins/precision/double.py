@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from contextlib import contextmanager
-from typing import Any, cast, Generator, List, Tuple
+from typing import Any, cast, Generator, List, Literal, Tuple
 
 import torch
 import torch.nn as nn
 from lightning_utilities.core.apply_func import apply_to_collection
-from torch import FloatTensor, Tensor
+from torch import Tensor
 from torch.optim import Optimizer
 
 import lightning.pytorch as pl
@@ -72,7 +72,7 @@ class LightningDoublePrecisionModule(_LightningPrecisionModuleWrapperBase):
 class DoublePrecisionPlugin(PrecisionPlugin):
     """Plugin for training with double (``torch.float64``) precision."""
 
-    precision: int = 64
+    precision: Literal["64-true"] = "64-true"
 
     def connect(
         self, model: nn.Module, optimizers: List[Optimizer], lr_schedulers: List[Any]
@@ -91,8 +91,8 @@ class DoublePrecisionPlugin(PrecisionPlugin):
     def forward_context(self) -> Generator[None, None, None]:
         """A context manager to change the default tensor type.
 
-        See: :meth:`torch.set_default_tensor_type`
+        See: :meth:`torch.set_default_dtype`
         """
-        torch.set_default_tensor_type(torch.DoubleTensor)
+        torch.set_default_dtype(torch.float64)
         yield
-        torch.set_default_tensor_type(FloatTensor)
+        torch.set_default_dtype(torch.float32)

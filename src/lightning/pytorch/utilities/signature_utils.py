@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ def is_param_in_hook_signature(
         hook_fx: the hook callable
         param: the name of the parameter to check
         explicit: whether the parameter has to be explicitly declared
-        min_args: whether the `signature` as at least `min_args` parameters
+        min_args: whether the `signature` has at least `min_args` parameters
     """
     parameters = inspect.getfullargspec(hook_fx)
     args = parameters.args[1:]  # ignore `self`

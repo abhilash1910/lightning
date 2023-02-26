@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
-from typing import Any, Dict, Generator, Optional, Union
+from typing import Any, Dict, Generator, Literal, Optional, Union
 
 import torch
 from torch import Tensor
@@ -22,6 +22,12 @@ from torch.optim import Optimizer
 from lightning.fabric.plugins.precision.utils import _convert_fp_tensor
 from lightning.fabric.utilities.types import _PARAMETERS, Optimizable
 
+_PRECISION_INPUT_INT = Literal[64, 32, 16]
+_PRECISION_INPUT_STR_ALIAS_CONVERSION = {"64": "64-true", "32": "32-true", "16": "16-mixed", "bf16": "bf16-mixed"}
+_PRECISION_INPUT_STR_ALIAS = Literal["64", "32", "16", "bf16"]
+_PRECISION_INPUT_STR = Literal["16-mixed", "bf16-mixed", "32-true", "64-true"]
+_PRECISION_INPUT = Union[_PRECISION_INPUT_INT, _PRECISION_INPUT_STR, _PRECISION_INPUT_STR_ALIAS]
+
 
 class Precision:
     """Base class for all plugins handling the precision-specific parts of the training.
@@ -29,7 +35,7 @@ class Precision:
     The class attribute precision must be overwritten in child classes. The default value reflects fp32 training.
     """
 
-    precision: Union[str, int] = 32
+    precision: _PRECISION_INPUT_STR = "32-true"
 
     def convert_module(self, module: Module) -> Module:
         """Convert the module parameters to the precision type this plugin handles.

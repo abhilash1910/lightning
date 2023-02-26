@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,17 +14,15 @@
 import contextlib
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Generator, List, Mapping, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Generator, Iterable, List, Mapping, Optional, Tuple, TypeVar, Union
 
 import torch
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader
 
 import lightning.pytorch as pl
 from lightning.fabric.plugins import CheckpointIO
-from lightning.fabric.strategies.launchers.base import _Launcher
 from lightning.fabric.utilities import move_data_to_device
 from lightning.fabric.utilities.distributed import ReduceOp
 from lightning.fabric.utilities.optimizer import _optimizer_to_device, _optimizers_to_device
@@ -33,6 +31,7 @@ from lightning.pytorch.core.optimizer import _init_optimizers_and_lr_schedulers,
 from lightning.pytorch.plugins import TorchCheckpointIO
 from lightning.pytorch.plugins.io.wrapper import _WrappingCheckpointIO
 from lightning.pytorch.plugins.precision import PrecisionPlugin
+from lightning.pytorch.strategies.launchers.launcher import _Launcher
 from lightning.pytorch.trainer.states import TrainerFn
 from lightning.pytorch.utilities.types import (
     LRSchedulerConfig,
@@ -65,9 +64,8 @@ class Strategy(ABC):
         self._model: Optional[Module] = None
         self._launcher: Optional[_Launcher] = None
         self._optimizers: List[Optimizer] = []
-        self._lightning_optimizers: Dict[int, LightningOptimizer] = {}
+        self._lightning_optimizers: List[LightningOptimizer] = []
         self.lr_scheduler_configs: List[LRSchedulerConfig] = []
-        self.optimizer_frequencies: List[int] = []
 
     @property
     def launcher(self) -> Optional[_Launcher]:
@@ -109,9 +107,7 @@ class Strategy(ABC):
     @optimizers.setter
     def optimizers(self, optimizers: List[Optimizer]) -> None:
         self._optimizers = optimizers
-        self._lightning_optimizers = {
-            idx: LightningOptimizer._to_lightning_optimizer(opt, self, idx) for idx, opt in enumerate(self.optimizers)
-        }
+        self._lightning_optimizers = [LightningOptimizer._to_lightning_optimizer(opt, self) for opt in optimizers]
 
     def connect(self, model: "pl.LightningModule") -> None:
         """Called by the accelerator to connect the accelerator and the model with this plugin."""
@@ -139,9 +135,7 @@ class Strategy(ABC):
         if trainer.state.fn != TrainerFn.FITTING:
             return
         assert self.lightning_module is not None
-        self.optimizers, self.lr_scheduler_configs, self.optimizer_frequencies = _init_optimizers_and_lr_schedulers(
-            self.lightning_module
-        )
+        self.optimizers, self.lr_scheduler_configs = _init_optimizers_and_lr_schedulers(self.lightning_module)
 
     def setup(self, trainer: "pl.Trainer") -> None:
         """Setup plugins for the trainer fit and creates optimizers.
@@ -174,7 +168,7 @@ class Strategy(ABC):
             optimizer = optimizer._optimizer
 
         if hasattr(optimizer, "consolidate_state_dict"):
-            # there are optimizers like Fairscale's OSS or PyTorch's ZeroRedundancyOptimizer that shard their
+            # there are optimizers like PyTorch's ZeroRedundancyOptimizer that shard their
             # states, and to avoid OOM we consolidate the full state on rank 0 only
             optimizer.consolidate_state_dict()
             return optimizer.state_dict() if self.is_global_zero else {}
@@ -186,7 +180,6 @@ class Strategy(ABC):
         self,
         closure_loss: Tensor,
         optimizer: Optional[Optimizer],
-        optimizer_idx: Optional[int],
         *args: Any,
         **kwargs: Any,
     ) -> Tensor:
@@ -195,7 +188,6 @@ class Strategy(ABC):
         Args:
             closure_loss: a tensor holding the loss value to backpropagate
             optimizer: An optional optimizer that gets passed down to the precision plugin's backward
-            optimizer_idx: An optional optimizer index that gets passed down to the precision plugin's backward
             \*args: Positional arguments that get passed down to the precision plugin's backward, intended as arguments
                 for the actual function that performs the backward, like :meth:`~torch.Tensor.backward`.
             \**kwargs: Keyword arguments for the same purpose as ``*args``.
@@ -204,7 +196,7 @@ class Strategy(ABC):
         assert self.lightning_module is not None
         closure_loss = self.precision_plugin.pre_backward(closure_loss, self.lightning_module)
 
-        self.precision_plugin.backward(closure_loss, self.lightning_module, optimizer, optimizer_idx, *args, **kwargs)
+        self.precision_plugin.backward(closure_loss, self.lightning_module, optimizer, *args, **kwargs)
 
         closure_loss = self.precision_plugin.post_backward(closure_loss, self.lightning_module)
         self.post_backward(closure_loss)
@@ -214,7 +206,6 @@ class Strategy(ABC):
     def optimizer_step(
         self,
         optimizer: Optimizer,
-        opt_idx: int,
         closure: Callable[[], Any],
         model: Optional[Union["pl.LightningModule", Module]] = None,
         **kwargs: Any,
@@ -223,17 +214,14 @@ class Strategy(ABC):
 
         Args:
             optimizer: the optimizer performing the step
-            opt_idx: index of the current optimizer
             closure: closure calculating the loss value
             model: reference to the model, optionally defining optimizer step related hooks
-            \**kwargs: Keyword arguments to to ``optimizer.step``
+            \**kwargs: Keyword arguments to ``optimizer.step``
         """
         model = model or self.lightning_module
-        # TODO(lite): remove assertion once strategy's optimizer_step typing is fixed
+        # TODO(fabric): remove assertion once strategy's optimizer_step typing is fixed
         assert isinstance(model, pl.LightningModule)
-        return self.precision_plugin.optimizer_step(
-            optimizer, model=model, optimizer_idx=opt_idx, closure=closure, **kwargs
-        )
+        return self.precision_plugin.optimizer_step(optimizer, model=model, closure=closure, **kwargs)
 
     def _setup_model_and_optimizers(self, model: Module, optimizers: List[Optimizer]) -> Tuple[Module, List[Optimizer]]:
         """Setup a model and multiple optimizers together.
@@ -241,19 +229,19 @@ class Strategy(ABC):
         The returned objects are expected to be in the same order they were passed in. The default implementation will
         call :meth:`_setup_model` and :meth:`_setup_optimizer` on the inputs.
         """
-        # TODO: standardize this across all plugins in Lightning and Lite. Related refactor: #7324
+        # TODO: standardize this across all plugins in Lightning and Fabric. Related refactor: #7324
         model = self._setup_model(model)
         optimizers = [self._setup_optimizer(optimizer) for optimizer in optimizers]
         return model, optimizers
 
     def _setup_model(self, model: Module) -> Module:
         """Performs setup for the model, e.g., by wrapping it by another class."""
-        # TODO: standardize this across all plugins in Lightning and Lite. Related refactor: #7324
+        # TODO: standardize this across all plugins in Lightning and Fabric. Related refactor: #7324
         return model
 
     def _setup_optimizer(self, optimizer: Optimizer) -> Optimizer:
         """Performs setup for the optimizer, e.g., by wrapping it by another class."""
-        # TODO: standardize this across all plugins in Lightning and Lite. Related refactor: #7324
+        # TODO: standardize this across all plugins in Lightning and Fabric. Related refactor: #7324
         return optimizer
 
     def batch_to_device(self, batch: Any, device: Optional[torch.device] = None, dataloader_idx: int = 0) -> Any:
@@ -356,6 +344,10 @@ class Strategy(ABC):
 
     def load_checkpoint(self, checkpoint_path: _PATH) -> Dict[str, Any]:
         torch.cuda.empty_cache()
+        try:
+            torch.xpu.empty_cache()
+        except AttributeError:
+            pass
         return self.checkpoint_io.load_checkpoint(checkpoint_path)
 
     def load_model_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
@@ -407,16 +399,7 @@ class Strategy(ABC):
             assert isinstance(self.model, PredictStep)
             return self.model.predict_step(*args, **kwargs)
 
-    def training_step_end(self, output: STEP_OUTPUT) -> STEP_OUTPUT:
-        return output
-
-    def validation_step_end(self, output: STEP_OUTPUT) -> STEP_OUTPUT:
-        return output
-
-    def test_step_end(self, output: STEP_OUTPUT) -> STEP_OUTPUT:
-        return output
-
-    def process_dataloader(self, dataloader: DataLoader) -> DataLoader:
+    def process_dataloader(self, dataloader: Iterable) -> Iterable:
         """Wraps the dataloader if necessary.
 
         Args:
@@ -426,11 +409,11 @@ class Strategy(ABC):
 
     @property
     def restore_checkpoint_after_setup(self) -> bool:
-        """Override to delay restoring from checkpoint till after pre-dispatch. This is useful when the plugin
-        requires all the setup hooks to run before loading checkpoint.
+        """Override to delay restoring from checkpoint till after the setup phase has completed. This is useful
+        when the strategy requires all the setup hooks to run before loading checkpoint.
 
         Returns:
-            If true, restore checkpoint after pre_dispatch.
+            If ``True``, restore checkpoint after strategy setup.
         """
         return False
 
@@ -492,7 +475,7 @@ class Strategy(ABC):
         _optimizers_to_device(self.optimizers, torch.device("cpu"))
 
         if self.lightning_module is not None:
-            log.detail(f"{self.__class__.__name__}: moving model to CPU")
+            log.debug(f"{self.__class__.__name__}: moving model to CPU")
             self.lightning_module.cpu()
         self.precision_plugin.teardown()
         assert self.accelerator is not None
@@ -539,14 +522,14 @@ class Strategy(ABC):
         """Called in the training loop before anything happens for that batch."""
         pass
 
-    def dispatch(self, trainer: "pl.Trainer") -> None:
-        """Hook to do something before the training/evaluation/prediction starts."""
-        self.precision_plugin.dispatch(trainer)
+    def on_exception(self, exception: BaseException) -> None:
+        """Called when the trainer execution is interrupted by an exception."""
+        pass
 
     def __getstate__(self) -> Dict:
         # `LightningOptimizer` overrides `self.__class__` so they cannot be pickled
         state = dict(vars(self))  # copy
-        state["_lightning_optimizers"] = {}
+        state["_lightning_optimizers"] = []
         return state
 
     def __setstate__(self, state: Dict) -> None:

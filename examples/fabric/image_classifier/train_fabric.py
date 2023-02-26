@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ and replace ``loss.backward()`` with ``self.backward(loss)``.
 
 Accelerate your training loop by setting the ``--accelerator``, ``--strategy``, ``--devices`` options directly from
 the command line. See ``lightning run model --help`` or learn more from the documentation:
-https://pytorch-lightning.readthedocs.io/en/latest/starter/lightning_fabric.html.
+https://pytorch-lightning.readthedocs.io/en/latest/fabric/fabric.html.
 """
 
 import argparse
@@ -77,7 +77,6 @@ def run(hparams):
     # by the command line. See all options: `lightning run model --help`
     fabric = Fabric()
 
-    fabric.hparams = hparams
     seed_everything(hparams.seed)  # instead of torch.manual_seed(...)
 
     transform = T.Compose([T.ToTensor(), T.Normalize((0.1307,), (0.3081,))])

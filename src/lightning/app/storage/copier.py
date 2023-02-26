@@ -1,3 +1,17 @@
+# Copyright The Lightning AI team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import concurrent.futures
 import pathlib
 import threading
@@ -5,6 +19,7 @@ from threading import Thread
 from time import time
 from typing import Optional, TYPE_CHECKING, Union
 
+from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
 
 from lightning.app.core.queues import BaseQueue
@@ -89,7 +104,11 @@ def _find_matching_path(work, request: _GetRequest) -> Optional["lightning.app.s
             return candidate
 
 
-def _copy_files(source_path: pathlib.Path, destination_path: pathlib.Path) -> None:
+def _copy_files(
+    source_path: pathlib.Path,
+    destination_path: pathlib.Path,
+    fs: Optional[AbstractFileSystem] = None,
+) -> None:
     """Copy files from one path to another.
 
     The source path must either be an existing file or folder. If the source is a folder, the destination path is
@@ -97,7 +116,8 @@ def _copy_files(source_path: pathlib.Path, destination_path: pathlib.Path) -> No
 
     Files in a folder are copied recursively and efficiently using multiple threads.
     """
-    fs = _filesystem()
+    if fs is None:
+        fs = _filesystem()
 
     def _copy(from_path: pathlib.Path, to_path: pathlib.Path) -> Optional[Exception]:
         _logger.debug(f"Copying {str(from_path)} -> {str(to_path)}")

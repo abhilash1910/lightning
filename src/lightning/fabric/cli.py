@@ -1,4 +1,4 @@
-# Copyright The PyTorch Lightning team.
+# Copyright The Lightning AI team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,21 +13,32 @@
 # limitations under the License.
 import logging
 import os
+import re
 from argparse import Namespace
 from typing import Any, List, Optional
 
 from lightning_utilities.core.imports import RequirementCache
+from typing_extensions import get_args
 
-from lightning.fabric.accelerators import CPUAccelerator, CUDAAccelerator, MPSAccelerator
+from lightning.fabric.accelerators import CPUAccelerator, CUDAAccelerator, MPSAccelerator, XPUAccelerator
+from lightning.fabric.plugins.precision.precision import _PRECISION_INPUT_STR, _PRECISION_INPUT_STR_ALIAS
+from lightning.fabric.strategies import STRATEGY_REGISTRY
 from lightning.fabric.utilities.device_parser import _parse_gpu_ids
 
 _log = logging.getLogger(__name__)
 
 _CLICK_AVAILABLE = RequirementCache("click")
 
-_SUPPORTED_ACCELERATORS = ("cpu", "gpu", "cuda", "mps", "tpu")
-_SUPPORTED_STRATEGIES = ("ddp", "dp", "deepspeed")
-_SUPPORTED_PRECISION = ("64", "32", "16", "bf16")
+_SUPPORTED_ACCELERATORS = ("cpu", "xpu", "gpu", "cuda", "mps", "tpu")
+
+
+def _get_supported_strategies() -> List[str]:
+    """Returns strategy choices from the registry, with the ones removed that are incompatible to be launched from
+    the CLI or ones that require further configuration by the user."""
+    available_strategies = STRATEGY_REGISTRY.available_strategies()
+    excluded = r".*(spawn|fork|notebook|xla|tpu|offload).*"
+    return [strategy for strategy in available_strategies if not re.match(excluded, strategy)]
+
 
 if _CLICK_AVAILABLE:
     import click
@@ -45,12 +56,12 @@ if _CLICK_AVAILABLE:
     @click.option(
         "--accelerator",
         type=click.Choice(_SUPPORTED_ACCELERATORS),
-        default="cpu",
+        default=None,
         help="The hardware accelerator to run on.",
     )
     @click.option(
         "--strategy",
-        type=click.Choice(_SUPPORTED_STRATEGIES),
+        type=click.Choice(_get_supported_strategies()),
         default=None,
         help="Strategy for how to run across multiple devices.",
     )
@@ -96,11 +107,11 @@ if _CLICK_AVAILABLE:
     )
     @click.option(
         "--precision",
-        type=click.Choice(_SUPPORTED_PRECISION),
-        default="32",
+        type=click.Choice(get_args(_PRECISION_INPUT_STR) + get_args(_PRECISION_INPUT_STR_ALIAS)),
+        default=None,
         help=(
-            "Double precision (``64``), full precision (``32``), half precision (``16``) or bfloat16 precision"
-            " (``'bf16'``)"
+            "Double precision (``64-true`` or ``64``), full precision (``32-true`` or ``64``), "
+            "half precision (``16-mixed`` or ``16``) or bfloat16 precision (``bf16-mixed`` or ``bf16``)"
         ),
     )
     @click.argument("script_args", nargs=-1, type=click.UNPROCESSED)
@@ -122,18 +133,22 @@ def _set_env_variables(args: Namespace) -> None:
     The Fabric connector will parse the arguments set here.
     """
     os.environ["LT_CLI_USED"] = "1"
-    os.environ["LT_ACCELERATOR"] = str(args.accelerator)
+    if args.accelerator is not None:
+        os.environ["LT_ACCELERATOR"] = str(args.accelerator)
     if args.strategy is not None:
         os.environ["LT_STRATEGY"] = str(args.strategy)
     os.environ["LT_DEVICES"] = str(args.devices)
     os.environ["LT_NUM_NODES"] = str(args.num_nodes)
-    os.environ["LT_PRECISION"] = str(args.precision)
+    if args.precision is not None:
+        os.environ["LT_PRECISION"] = str(args.precision)
 
 
 def _get_num_processes(accelerator: str, devices: str) -> int:
     """Parse the `devices` argument to determine how many processes need to be launched on the current machine."""
     if accelerator == "gpu":
-        parsed_devices = _parse_gpu_ids(devices, include_cuda=True, include_mps=True)
+        parsed_devices = _parse_gpu_ids(devices, include_xpu=True, include_cuda=True, include_mps=True)
+    elif accelerator == "xpu":
+        parsed_devices = XPUAccelerator.parse_devices(devices)
     elif accelerator == "cuda":
         parsed_devices = CUDAAccelerator.parse_devices(devices)
     elif accelerator == "mps":
